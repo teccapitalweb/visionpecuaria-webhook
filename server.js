@@ -57,9 +57,18 @@ app.get('/', (req, res) => res.json({ status: 'Visión Pecuaria Webhook OK 🐄'
 // 1) CREAR CHECKOUT SESSION — Stripe Embedded
 // El frontend llama aquí y recibe un clientSecret que monta el formulario
 // ═════════════════════════════════════════════════════════════════════════════
+// Helper: limpia strings para que no rompan URLs ni metadata de Stripe
+// Stripe acepta UTF-8 en metadata, pero el problema viene en URLs.
+// Aquí limpiamos espacios extra y normalizamos.
+function sanearTexto(s) {
+  if (!s) return '';
+  return String(s).normalize('NFC').trim().slice(0, 500);
+}
+
 app.post('/crear-checkout', async (req, res) => {
   try {
-    const { plan, email, uid, nombre, whatsapp } = req.body;
+    const { plan, email: emailRaw, uid, nombre, whatsapp } = req.body;
+    const email = (emailRaw || '').toLowerCase().trim();
 
     if (!email) return res.status(400).json({ error: 'Email requerido' });
     if (!plan || !['mensual', 'anual'].includes(plan)) {
@@ -68,6 +77,11 @@ app.post('/crear-checkout', async (req, res) => {
 
     const priceId = plan === 'anual' ? PRICE_ANUAL : PRICE_MENSUAL;
 
+    // Sanear todos los strings que van a metadata (Stripe acepta UTF-8 pero limpiamos por seguridad)
+    const nombreLimpio = sanearTexto(nombre);
+    const whatsappLimpio = sanearTexto(whatsapp).replace(/\D/g, '');
+    const uidLimpio = sanearTexto(uid);
+
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       ui_mode: 'embedded',
@@ -75,25 +89,32 @@ app.post('/crear-checkout', async (req, res) => {
       customer_email: email,
       allow_promotion_codes: true,
       metadata: {
-        uid: uid || '',
-        nombre: nombre || '',
-        whatsapp: whatsapp || '',
+        uid: uidLimpio,
+        nombre: nombreLimpio,
+        whatsapp: whatsappLimpio,
         plan
       },
       subscription_data: {
         metadata: {
-          uid: uid || '',
+          uid: uidLimpio,
           email,
-          nombre: nombre || '',
-          whatsapp: whatsapp || '',
+          nombre: nombreLimpio,
+          whatsapp: whatsappLimpio,
           plan
         }
       },
-      return_url: `https://teccapitalweb.github.io/Visión Pecuaria---mx/index.html?pago_exitoso=1&session_id={CHECKOUT_SESSION_ID}`
+      // FIX CRÍTICO: la URL anterior tenía acento (Visión) y espacio que rompe Stripe.
+      // Ahora apuntamos al dominio real sin caracteres especiales.
+      return_url: 'https://www.visionpecuariamx.com/?pago_exitoso=1&session_id={CHECKOUT_SESSION_ID}'
     });
 
     console.log('✅ Checkout session creada:', session.id, 'para', email);
-    res.json({ clientSecret: session.client_secret });
+    // Devolvemos AMBOS: client_secret (para modo embedded) y url (por si el frontend usa redirect)
+    res.json({
+      clientSecret: session.client_secret,
+      url: session.url || null,
+      sessionId: session.id
+    });
 
   } catch (err) {
     console.error('❌ Error crear-checkout:', err);
