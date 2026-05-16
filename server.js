@@ -103,9 +103,9 @@ app.post('/crear-checkout', async (req, res) => {
           plan
         }
       },
-      // FIX CRÍTICO: la URL anterior tenía acento (Visión) y espacio que rompe Stripe.
-      // Ahora apuntamos al dominio real sin caracteres especiales.
-      return_url: 'https://www.visionpecuariamx.com/?pago_exitoso=1&session_id={CHECKOUT_SESSION_ID}'
+      // MODIFICADO: return_url ahora apunta al portal de socio directamente.
+      // Así el usuario ve la animación de bienvenida sin pasar por la landing.
+      return_url: 'https://teccapitalweb.github.io/VisionPecuaria/?pago_exitoso=1&session_id={CHECKOUT_SESSION_ID}'
     });
 
     console.log('✅ Checkout session creada:', session.id, 'para', email);
