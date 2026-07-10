@@ -235,6 +235,7 @@ app.post('/crear-checkout-curso', async (req, res) => {
         quantity: 1
       }],
       customer_email: email,
+      allow_promotion_codes: true,     // ← permite cupones (pruebas + ofertas futuras)
       metadata: {
         tipo: 'curso',
         slug: slugLimpio,
