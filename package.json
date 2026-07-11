@@ -1,7 +1,7 @@
 {
   "name": "visionpecuaria-webhook",
-  "version": "1.0.0",
-  "description": "Webhook de Stripe + Firebase para Visión Pecuaria",
+  "version": "1.1.0",
+  "description": "Webhook de Stripe + Firebase para Visión Pecuaria (membresía + cursos + certificados por email)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -9,7 +9,8 @@
   "dependencies": {
     "express": "^4.18.2",
     "firebase-admin": "^12.0.0",
-    "stripe": "^14.25.0"
+    "stripe": "^14.25.0",
+    "resend": "^3.5.0"
   },
   "engines": {
     "node": ">=18"

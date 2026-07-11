@@ -1,6 +1,7 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const Stripe = require('stripe');
+const { Resend } = require('resend');
 
 const app = express();
 
@@ -15,6 +16,12 @@ const auth = admin.auth();
 // ─── Stripe init ─────────────────────────────────────────────────────────────
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+
+// ─── Resend init (envío de emails transaccionales) ──────────────────────────
+// La key la pones como env var en Railway: RESEND_API_KEY=re_xxxxx
+// Mientras no esté configurada, el envío falla silenciosamente sin romper el webhook.
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+const EMAIL_FROM = process.env.EMAIL_FROM || 'Visión Pecuaria <no-responder@visionpecuariamx.com>';
 
 // Price IDs (en variables de entorno para poder cambiar sin tocar código)
 const PRICE_MENSUAL = process.env.STRIPE_PRICE_MENSUAL || 'price_1TPb9nPBgqsOPfUYOzCZpX42';
@@ -622,10 +629,219 @@ async function procesarCompraCurso(session) {
 
     console.log(`✅ CURSO activado: ${email} | slug: ${slug} | uid: ${uid} | ${(montoPagado / 100).toFixed(2)} MXN${esLanzamiento ? ' (LANZAMIENTO)' : ''}`);
 
+    // ── 6) Generar certificado + enviar email de confirmación ──
+    // Fuera de la transacción principal para no bloquearla.
+    // Si falla, la compra ya está registrada; se puede reintentar manualmente.
+    try {
+      await generarCertificadoYEnviarEmail({ slug, uid, email, nombre, sessionId });
+    } catch (postErr) {
+      console.error(`⚠️  Certificado/email falló para ${email} (session ${sessionId}):`, postErr.message);
+      // No relanzamos: el acceso ya está otorgado; el certificado se puede reemitir después.
+    }
+
   } catch (err) {
     console.error(`❌ CURSO: transacción falló para session ${sessionId}:`, err);
     throw err;
   }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// generarCertificadoYEnviarEmail — se llama después de procesarCompraCurso
+//
+// Hace 3 cosas:
+//   1. Crea doc en `certificados/{folio}` con esquema idéntico al del panel VIP,
+//      pero con tipo:'curso' para distinguir de certificados de membresía.
+//   2. Genera el folio único IPCI-VP-{año}-{XXXX} (padding 4 dígitos).
+//   3. Envía email con Resend al alumno, con botón "Ver mi certificado" +
+//      link al contenido del curso.
+// ═════════════════════════════════════════════════════════════════════════════
+async function generarCertificadoYEnviarEmail({ slug, uid, email, nombre, sessionId }) {
+  // 1) Leer datos del curso para el certificado
+  const cursoDoc = await db.collection('cursosVenta').doc(slug).get();
+  if (!cursoDoc.exists) {
+    console.warn(`⚠️  Curso ${slug} no existe en Firestore, no se puede generar certificado`);
+    return;
+  }
+  const curso = cursoDoc.data();
+
+  // 2) Generar folio: IPCI-VP-YYYY-XXXX (padding 4 dígitos)
+  //    Contamos certificados existentes para el año actual + 1
+  const year = new Date().getFullYear();
+  const certsSnap = await db.collection('certificados').get();
+  const consecutivo = String(certsSnap.size + 1).padStart(4, '0');
+  const folio = `IPCI-VP-${year}-${consecutivo}`;
+
+  // 3) Crear el doc del certificado en Firestore
+  //    Esquema alineado con el que usa el panel VIP admin:
+  //    email, nombre/miembroNombre, cursoTitulo, horas, instructor, folio, estado, fechaEmision
+  const certData = {
+    folio,
+    tipo: 'curso',                          // distingue de certificados de membresía
+    email: email.toLowerCase(),
+    nombre,
+    miembroNombre: nombre,                   // alias por compatibilidad con ver-certificado.html
+    uid,
+    cursoTitulo: curso.nombre || slug,
+    cursoSlug: slug,
+    horas: Number(curso.duracionHoras) || 0,
+    instructor: curso.instructorNombre || 'M.V.Z. José Antonio Castillo García',
+    stripeSessionId: sessionId,
+    estado: 'emitido',
+    fechaEmision: admin.firestore.FieldValue.serverTimestamp()
+  };
+
+  await db.collection('certificados').doc(folio).set(certData);
+  console.log(`🎖️  Certificado emitido: ${folio} para ${email}`);
+
+  // 4) Enviar email al alumno con Resend
+  if (!resend) {
+    console.warn('⚠️  RESEND_API_KEY no configurada — email no enviado');
+    return;
+  }
+
+  const certificadoUrl = `${PUBLIC_SITE_URL}/ver-certificado.html?folio=${encodeURIComponent(folio)}`;
+  const accesoUrl      = `${PUBLIC_SITE_URL}/curso-acceso.html?slug=${encodeURIComponent(slug)}`;
+  const emailHtml      = renderEmailBienvenidaCurso({
+    nombre,
+    cursoTitulo: curso.nombre || slug,
+    folio,
+    accesoUrl,
+    certificadoUrl
+  });
+
+  try {
+    const { data, error } = await resend.emails.send({
+      from: EMAIL_FROM,
+      to: [email],
+      subject: `🎉 ¡Bienvenido al curso ${curso.nombre || slug}! (Certificado ${folio})`,
+      html: emailHtml
+    });
+    if (error) {
+      console.error('❌ Resend error:', error);
+    } else {
+      console.log(`📧 Email enviado a ${email} (id: ${data.id})`);
+    }
+  } catch (mailErr) {
+    console.error('❌ Excepción enviando email:', mailErr.message);
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// renderEmailBienvenidaCurso — HTML del email transaccional
+//
+// Diseño inline-CSS friendly (Gmail, Outlook, iOS Mail).
+// Paleta: verde VP + dorado, mismo lenguaje visual de la landing.
+// ═════════════════════════════════════════════════════════════════════════════
+function renderEmailBienvenidaCurso({ nombre, cursoTitulo, folio, accesoUrl, certificadoUrl }) {
+  const primerNombre = (nombre || 'Alumno').split(' ')[0];
+  return `<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>¡Bienvenido a tu curso!</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f8f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;color:#111b15;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f3f8f5;padding:32px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;background:#ffffff;border-radius:20px;overflow:hidden;box-shadow:0 8px 24px rgba(11,32,20,.08);">
+
+          <!-- Header con logo -->
+          <tr>
+            <td style="background:linear-gradient(135deg,#163d28 0%,#1f5c40 100%);padding:36px 32px;text-align:center;">
+              <div style="color:#e8c465;font-size:12px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;margin-bottom:8px;">Visión Pecuaria</div>
+              <div style="color:#ffffff;font-size:24px;font-weight:800;letter-spacing:-.02em;">🎉 ¡Tu inscripción está confirmada!</div>
+            </td>
+          </tr>
+
+          <!-- Cuerpo -->
+          <tr>
+            <td style="padding:36px 32px 24px;">
+              <p style="margin:0 0 16px;font-size:16px;line-height:1.6;color:#111b15;">
+                Hola <b>${escapeHtml(primerNombre)}</b>,
+              </p>
+              <p style="margin:0 0 20px;font-size:16px;line-height:1.6;color:#2a3730;">
+                Bienvenido al curso <b>${escapeHtml(cursoTitulo)}</b>. Tu pago se procesó correctamente y ya tienes acceso permanente al contenido, materiales descargables y a tu certificado digital con folio válido.
+              </p>
+
+              <!-- Cajita del folio -->
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f3f8f5;border:1px solid rgba(31,92,64,.15);border-radius:12px;margin:20px 0;">
+                <tr>
+                  <td style="padding:16px 20px;">
+                    <div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#5a6b61;font-weight:700;margin-bottom:4px;">Tu folio de certificado</div>
+                    <div style="font-size:20px;font-weight:800;color:#1f5c40;letter-spacing:-.01em;font-family:'Menlo','Monaco',monospace;">${escapeHtml(folio)}</div>
+                  </td>
+                </tr>
+              </table>
+
+              <!-- Botones CTA -->
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:24px 0;">
+                <tr>
+                  <td align="center" style="padding:6px;">
+                    <a href="${accesoUrl}" style="display:inline-block;background:linear-gradient(180deg,#1f5c40,#163d28);color:#ffffff;text-decoration:none;padding:14px 28px;border-radius:10px;font-weight:800;font-size:15px;letter-spacing:.01em;box-shadow:0 4px 12px rgba(15,61,39,.25);">
+                      🎥 Acceder al curso
+                    </a>
+                  </td>
+                </tr>
+                <tr>
+                  <td align="center" style="padding:6px;">
+                    <a href="${certificadoUrl}" style="display:inline-block;background:#ffffff;color:#1f5c40;text-decoration:none;padding:14px 28px;border-radius:10px;font-weight:800;font-size:15px;letter-spacing:.01em;border:2px solid #d4a017;">
+                      🎖️ Ver mi certificado
+                    </a>
+                  </td>
+                </tr>
+              </table>
+
+              <!-- Qué incluye -->
+              <div style="margin:28px 0 8px;font-size:14px;font-weight:700;color:#163d28;">Qué incluye tu inscripción</div>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:16px;">
+                <tr><td style="padding:6px 0;font-size:14px;color:#2a3730;line-height:1.5;">✓ Acceso permanente a las videoclases</td></tr>
+                <tr><td style="padding:6px 0;font-size:14px;color:#2a3730;line-height:1.5;">✓ Recetario descargable en PDF</td></tr>
+                <tr><td style="padding:6px 0;font-size:14px;color:#2a3730;line-height:1.5;">✓ Calculadora de costo y precio en Excel</td></tr>
+                <tr><td style="padding:6px 0;font-size:14px;color:#2a3730;line-height:1.5;">✓ Canal VIP de WhatsApp con novedades</td></tr>
+                <tr><td style="padding:6px 0;font-size:14px;color:#2a3730;line-height:1.5;">✓ Certificado digital con QR verificable</td></tr>
+              </table>
+
+              <!-- Tip -->
+              <div style="background:rgba(212,160,23,.10);border-left:3px solid #d4a017;padding:12px 16px;border-radius:6px;margin:20px 0;">
+                <div style="font-size:13px;color:#2a3730;line-height:1.55;">
+                  <b>Guarda este correo</b> — tu folio <code style="background:rgba(0,0,0,.05);padding:2px 6px;border-radius:4px;font-family:'Menlo','Monaco',monospace;font-size:12px;">${escapeHtml(folio)}</code> es único y sirve para verificar tu certificado en cualquier momento.
+                </div>
+              </div>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="background:#f3f8f5;padding:24px 32px;border-top:1px solid rgba(31,92,64,.10);text-align:center;">
+              <div style="font-size:12px;color:#5a6b61;line-height:1.6;">
+                ¿Tienes preguntas? Escríbenos por WhatsApp al<br>
+                <a href="https://wa.me/522382514313" style="color:#1f5c40;font-weight:700;text-decoration:none;">238-251-4313</a>
+              </div>
+              <div style="font-size:11px;color:#8a9990;margin-top:16px;letter-spacing:.06em;">
+                © ${new Date().getFullYear()} Visión Pecuaria · Excelencia en producción animal
+              </div>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+}
+
+// Helper: escapar HTML para prevenir inyección en el email
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -664,6 +880,62 @@ app.post('/cancelar-membresia', async (req, res) => {
   } catch (err) {
     console.error('❌ Error cancelar-membresia:', err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 5) REENVIAR CERTIFICADO POR EMAIL — para que el alumno lo pida si lo perdió
+//    POST /reenviar-certificado  body: { email, slug }
+// ═════════════════════════════════════════════════════════════════════════════
+app.post('/reenviar-certificado', async (req, res) => {
+  try {
+    const { email: emailRaw, slug } = req.body;
+    if (!emailRaw || !slug) return res.status(400).json({ error: 'email y slug requeridos' });
+
+    const email = emailRaw.toLowerCase().trim();
+
+    // Buscar el certificado del curso para este email
+    const certsSnap = await db.collection('certificados')
+      .where('email', '==', email)
+      .where('cursoSlug', '==', slug)
+      .limit(1)
+      .get();
+
+    if (certsSnap.empty) {
+      return res.status(404).json({ error: 'No hay certificado emitido para ese email en este curso' });
+    }
+
+    const cert = certsSnap.docs[0].data();
+    const cursoDoc = await db.collection('cursosVenta').doc(slug).get();
+    const cursoTitulo = cursoDoc.exists ? (cursoDoc.data().nombre || slug) : slug;
+
+    if (!resend) {
+      return res.status(503).json({ error: 'Servicio de email no configurado en el servidor' });
+    }
+
+    const certificadoUrl = `${PUBLIC_SITE_URL}/ver-certificado.html?folio=${encodeURIComponent(cert.folio)}`;
+    const accesoUrl      = `${PUBLIC_SITE_URL}/curso-acceso.html?slug=${encodeURIComponent(slug)}`;
+    const html = renderEmailBienvenidaCurso({
+      nombre: cert.nombre || 'Alumno',
+      cursoTitulo,
+      folio: cert.folio,
+      accesoUrl,
+      certificadoUrl
+    });
+
+    const { data, error } = await resend.emails.send({
+      from: EMAIL_FROM,
+      to: [email],
+      subject: `Tu certificado de ${cursoTitulo} (folio ${cert.folio})`,
+      html
+    });
+
+    if (error) return res.status(500).json({ error: 'Fallo al enviar', details: error });
+    return res.json({ ok: true, folio: cert.folio, emailId: data.id });
+
+  } catch (err) {
+    console.error('❌ /reenviar-certificado:', err);
+    return res.status(500).json({ error: err.message });
   }
 });
 
