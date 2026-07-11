@@ -64,8 +64,10 @@ async function buscarMiembroPorEmail(email) {
 // Health check
 app.get('/', (req, res) => res.json({
   status: 'Visión Pecuaria Webhook OK 🐄',
+  version: '1.1.0',
   stripe: true,
-  features: ['membresia', 'curso']
+  resend: !!resend,
+  features: ['membresia', 'curso', 'certificados', 'email']
 }));
 
 // ═════════════════════════════════════════════════════════════════════════════
