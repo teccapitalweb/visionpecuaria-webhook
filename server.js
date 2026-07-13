@@ -1,160 +1,355 @@
 const express = require('express');
-const cors = require('cors');
+const admin = require('firebase-admin');
 const Stripe = require('stripe');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
+// ─── Firebase Admin init ─────────────────────────────────────────────────────
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+const db = admin.firestore();
+const auth = admin.auth();
+
+// ─── Stripe init ─────────────────────────────────────────────────────────────
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-const SITE_URL = process.env.SITE_URL; // ej: https://teccapitalweb.github.io/visionpecuaria-curso
-const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID;
-const EMAILJS_TEMPLATE_ID = process.env.EMAILJS_TEMPLATE_ID;
-const EMAILJS_PUBLIC_KEY = process.env.EMAILJS_PUBLIC_KEY;
-const EMAILJS_PRIVATE_KEY = process.env.EMAILJS_PRIVATE_KEY;
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 
-// Price ID del curso de Visión Pecuaria. Como el mismo Stripe manda TODOS los
-// eventos de la cuenta a los 3 webhooks (Visión Pecuaria, Evalua RH, Gymvexa),
-// hay que filtrar aquí para no procesar pagos que sean de otro proyecto.
-const PRICE_ID_VISION_PECUARIA = process.env.STRIPE_PRICE_ID; // price_1TrQu3DCxZfVu338ntIf87Zl
+// Price IDs (en variables de entorno para poder cambiar sin tocar código)
+const PRICE_MENSUAL = process.env.STRIPE_PRICE_MENSUAL || 'price_1TPb9nPBgqsOPfUYOzCZpX42';
+const PRICE_ANUAL   = process.env.STRIPE_PRICE_ANUAL   || 'price_1TPbCQPBgqsOPfUYZhUk9OGQ';
 
-app.use(cors());
+// ─── CORS global ─────────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, stripe-signature');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
 
-// ---------------------------------------------------------------
-// Webhook de Stripe: cuando se confirma un pago, manda el correo
-// con el link de acceso al curso. Necesita el body crudo (raw),
-// por eso va ANTES de express.json().
-// ---------------------------------------------------------------
-app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+// ─── Raw body para Stripe (DEBE ir antes de express.json) ────────────────────
+app.use('/stripe-webhook', express.raw({ type: 'application/json' }));
+app.use(express.json());
+
+// ─── Helper: buscar miembro por email ────────────────────────────────────────
+async function buscarMiembroPorEmail(email) {
+  try {
+    const user = await auth.getUserByEmail(email);
+    const doc  = await db.collection('miembros').doc(user.uid).get();
+    if (doc.exists) return { uid: user.uid, ref: doc.ref, userExists: true };
+    return { uid: user.uid, ref: db.collection('miembros').doc(user.uid), userExists: true };
+  } catch (e) {}
+
+  const snap = await db.collection('miembros').where('email', '==', email).limit(1).get();
+  if (!snap.empty) {
+    const doc = snap.docs[0];
+    return { uid: doc.id, ref: doc.ref, userExists: false };
+  }
+  return null;
+}
+
+// Health check
+app.get('/', (req, res) => res.json({ status: 'Visión Pecuaria Webhook OK 🐄', stripe: true }));
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 1) CREAR CHECKOUT SESSION — Stripe Embedded
+// El frontend llama aquí y recibe un clientSecret que monta el formulario
+// ═════════════════════════════════════════════════════════════════════════════
+// Helper: limpia strings para que no rompan URLs ni metadata de Stripe
+// Stripe acepta UTF-8 en metadata, pero el problema viene en URLs.
+// Aquí limpiamos espacios extra y normalizamos.
+function sanearTexto(s) {
+  if (!s) return '';
+  return String(s).normalize('NFC').trim().slice(0, 500);
+}
+
+app.post('/crear-checkout', async (req, res) => {
+  try {
+    const { plan, email: emailRaw, uid, nombre, whatsapp } = req.body;
+    const email = (emailRaw || '').toLowerCase().trim();
+
+    if (!email) return res.status(400).json({ error: 'Email requerido' });
+    if (!plan || !['mensual', 'anual'].includes(plan)) {
+      return res.status(400).json({ error: 'Plan inválido (mensual|anual)' });
+    }
+
+    const priceId = plan === 'anual' ? PRICE_ANUAL : PRICE_MENSUAL;
+
+    // Sanear todos los strings que van a metadata (Stripe acepta UTF-8 pero limpiamos por seguridad)
+    const nombreLimpio = sanearTexto(nombre);
+    const whatsappLimpio = sanearTexto(whatsapp).replace(/\D/g, '');
+    const uidLimpio = sanearTexto(uid);
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      ui_mode: 'embedded',
+      line_items: [{ price: priceId, quantity: 1 }],
+      customer_email: email,
+      allow_promotion_codes: true,
+      metadata: {
+        uid: uidLimpio,
+        nombre: nombreLimpio,
+        whatsapp: whatsappLimpio,
+        plan
+      },
+      subscription_data: {
+        metadata: {
+          uid: uidLimpio,
+          email,
+          nombre: nombreLimpio,
+          whatsapp: whatsappLimpio,
+          plan
+        }
+      },
+      // MODIFICADO: return_url ahora apunta al portal de socio directamente.
+      // Así el usuario ve la animación de bienvenida sin pasar por la landing.
+      return_url: 'https://teccapitalweb.github.io/VisionPecuaria/?pago_exitoso=1&session_id={CHECKOUT_SESSION_ID}'
+    });
+
+    console.log('✅ Checkout session creada:', session.id, 'para', email);
+    // Devolvemos AMBOS: client_secret (para modo embedded) y url (por si el frontend usa redirect)
+    res.json({
+      clientSecret: session.client_secret,
+      url: session.url || null,
+      sessionId: session.id
+    });
+
+  } catch (err) {
+    console.error('❌ Error crear-checkout:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 2) VERIFICAR SESSION — el frontend puede preguntar el estado después de pagar
+// ═════════════════════════════════════════════════════════════════════════════
+app.get('/verificar-session/:sessionId', async (req, res) => {
+  try {
+    const session = await stripe.checkout.sessions.retrieve(req.params.sessionId);
+    res.json({
+      status: session.status,
+      payment_status: session.payment_status,
+      customer_email: session.customer_email
+    });
+  } catch (err) {
+    console.error('❌ Error verificar-session:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 3) WEBHOOK STRIPE — recibe eventos y actualiza Firestore
+// ═════════════════════════════════════════════════════════════════════════════
+app.post('/stripe-webhook', async (req, res) => {
   let event;
+  const sig = req.headers['stripe-signature'];
 
   try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      req.headers['stripe-signature'],
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
+    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
   } catch (err) {
-    console.error('Firma de webhook inválida:', err.message);
+    console.error('❌ Firma Stripe inválida:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
+  console.log('📩 Evento Stripe:', event.type);
 
-    // Filtro: nos aseguramos de que este pago sea del curso de Visión
-    // Pecuaria y no de otro proyecto (Evalua RH, Gymvexa, etc.) que
-    // comparte la misma cuenta de Stripe.
-    let esDeEsteProyecto = false;
-    try {
-      const lineItems = await stripe.checkout.sessions.listLineItems(session.id, { limit: 10 });
-      esDeEsteProyecto = lineItems.data.some(function(item){
-        return item.price && item.price.id === PRICE_ID_VISION_PECUARIA;
-      });
-    } catch (err) {
-      console.error('Error consultando line items:', err.message);
-    }
+  try {
+    switch (event.type) {
 
-    if (!esDeEsteProyecto) {
-      console.log('Evento ignorado, no es del producto de Visión Pecuaria. session:', session.id);
-      return res.json({ received: true, ignorado: true });
-    }
+      // ─── Pago exitoso — ACTIVAR membresía ─────────────────────────────────
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        const email = (session.customer_email || session.customer_details?.email || '').toLowerCase().trim();
+        const nombre = session.metadata?.nombre || session.customer_details?.name || email.split('@')[0];
+        // ═══ FIX: WhatsApp desde múltiples fuentes ═══
+        // Prioridad: 1) metadata (mandado por el frontend) → 2) usuarios_free → 3) Stripe phone
+        let whatsapp = session.metadata?.whatsapp || '';
+        const planKey = session.metadata?.plan || 'mensual';
+        const plan = planKey === 'anual' ? 'VIP Anual' : 'VIP Mensual';
 
-    const email = session.customer_details ? session.customer_details.email : null;
-    const sessionId = session.id;
-
-    if (email) {
-      const link = `${SITE_URL}/curso.html?session_id=${sessionId}`;
-      try {
-        const respuesta = await fetch('https://api.emailjs.com/api/v1.0/email/send', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            service_id: EMAILJS_SERVICE_ID,
-            template_id: EMAILJS_TEMPLATE_ID,
-            user_id: EMAILJS_PUBLIC_KEY,
-            accessToken: EMAILJS_PRIVATE_KEY,
-            template_params: {
-              to_email: email,
-              curso_link: link
-            }
-          })
-        });
-        if (!respuesta.ok) {
-          const texto = await respuesta.text();
-          console.error('EmailJS respondió con error:', respuesta.status, texto);
-        } else {
-          console.log('Correo de acceso enviado a:', email);
+        if (!email) {
+          console.warn('⚠️ Sin email en session');
+          return res.status(200).json({ received: true });
         }
-      } catch (err) {
-        console.error('Error enviando correo con EmailJS:', err);
+
+        const vence = new Date();
+        plan === 'VIP Anual' ? vence.setFullYear(vence.getFullYear() + 1) : vence.setMonth(vence.getMonth() + 1);
+        const venceStr = vence.toLocaleDateString('es-MX', { day: 'numeric', month: 'long', year: 'numeric' });
+
+        let uid = session.metadata?.uid || null;
+
+        if (!uid) {
+          try {
+            const user = await auth.getUserByEmail(email);
+            uid = user.uid;
+            console.log(`✅ UID recuperado de Firebase Auth: ${uid}`);
+          } catch (e) {
+            console.warn(`⚠️ Usuario no existe en Firebase Auth para email: ${email}. Intentando crearlo automáticamente...`);
+            try {
+              const newUser = await auth.createUser({
+                email: email,
+                displayName: nombre || email.split('@')[0],
+                emailVerified: true
+              });
+              uid = newUser.uid;
+              console.log(`✅ Usuario creado automáticamente en Firebase Auth: ${uid}`);
+            } catch (createError) {
+              console.error(`❌ No se pudo crear usuario Auth: ${createError.message}`);
+            }
+          }
+        }
+
+        // ═══ FIX: Si aún no tenemos WhatsApp, buscar en usuarios_free ═══
+        if (!whatsapp && uid) {
+          try {
+            const freeDoc = await db.collection('usuarios_free').doc(uid).get();
+            if (freeDoc.exists) {
+              const freeData = freeDoc.data();
+              if (freeData.whatsapp) {
+                whatsapp = freeData.whatsapp;
+                console.log('📱 WhatsApp recuperado de usuarios_free:', whatsapp);
+              }
+            }
+          } catch (e) {
+            console.warn('⚠️ No se pudo leer usuarios_free:', e.message);
+          }
+        }
+
+        // Último fallback: el phone que Stripe pudo haber capturado
+        if (!whatsapp) {
+          whatsapp = session.customer_details?.phone || '';
+        }
+
+        const docId = uid || email;
+        if (docId) {
+          console.log(`📝 Escribiendo en miembros/${docId} (uid: ${uid ? 'sí' : 'NO - usando email'})`);
+          await db.collection('miembros').doc(docId).set({
+            nombre,
+            email,
+            whatsapp,
+            plan,
+            estado: 'activo',
+            vence: venceStr,
+            fechaRegistro: new Date().toISOString(),
+            stripeCustomerId: session.customer,
+            stripeSubscriptionId: session.subscription,
+            ultimoPago: new Date().toISOString(),
+            uid: uid || null,
+          }, { merge: true });
+
+            const monto = session.amount_total
+              ? (session.amount_total / 100).toFixed(2) + ' ' + (session.currency || 'MXN').toUpperCase()
+              : '—';
+
+            await db.collection('pagos').add({
+              nombre, email, plan, monto,
+              stripeSessionId: session.id,
+              stripeSubscriptionId: session.subscription,
+              fecha: new Date().toISOString(),
+              estado: 'confirmado'
+            });
+
+            console.log(`✅ Miembro activado: ${email} | Plan: ${plan} | Vence: ${venceStr}`);
+          } else {
+            console.error(`❌ CRÍTICO: Sin uid ni email para crear documento. Metadata: ${JSON.stringify(session.metadata)}`);
+          }
+          break;
+        }
+
+      // ─── Suscripción actualizada (ej. renovación automática) ──────────────
+      case 'customer.subscription.updated': {
+        const sub = event.data.object;
+        const email = (sub.metadata?.email || '').toLowerCase().trim();
+
+        if (email) {
+          const m = await buscarMiembroPorEmail(email);
+          if (m && m.userExists) {
+            const nuevoEstado = sub.status === 'active' || sub.status === 'trialing' ? 'activo' : 'inactivo';
+
+            const vence = new Date(sub.current_period_end * 1000);
+            const venceStr = vence.toLocaleDateString('es-MX', { day: 'numeric', month: 'long', year: 'numeric' });
+
+            await m.ref.update({
+              estado: nuevoEstado,
+              vence: venceStr,
+              stripeSubscriptionId: sub.id
+            });
+            console.log(`🔁 Suscripción actualizada: ${email} → ${nuevoEstado}`);
+          }
+        }
+        break;
       }
-    } else {
-      console.warn('checkout.session.completed sin email de cliente, sesión:', sessionId);
-    }
-  }
 
-  res.json({ received: true });
-});
+      // ─── Suscripción cancelada ────────────────────────────────────────────
+      case 'customer.subscription.deleted': {
+        const sub = event.data.object;
+        const email = (sub.metadata?.email || '').toLowerCase().trim();
 
-app.use(express.json());
+        if (email) {
+          const m = await buscarMiembroPorEmail(email);
+          if (m && m.userExists) {
+            await m.ref.update({
+              estado: 'inactivo',
+              canceladoEn: new Date().toISOString()
+            });
+            console.log('🛑 Membresía cancelada (Stripe):', email);
+          }
+        }
+        break;
+      }
 
-// ---------------------------------------------------------------
-// Endpoint que usa curso.html para verificar si un session_id
-// realmente está pagado antes de mostrar el contenido.
-// ---------------------------------------------------------------
-// ---------------------------------------------------------------
-// Crea una sesión de Stripe Checkout en modo "embedded" para que el
-// pago se muestre incrustado en la misma página, sin salir del sitio.
-// ---------------------------------------------------------------
-app.post('/crear-sesion-checkout', async (req, res) => {
-  try {
-    const session = await stripe.checkout.sessions.create({
-      ui_mode: 'embedded',
-      mode: 'payment',
-      line_items: [
-        { price: PRICE_ID_VISION_PECUARIA, quantity: 1 }
-      ],
-      return_url: `${SITE_URL}/curso.html?session_id={CHECKOUT_SESSION_ID}`
-    });
-    res.json({ clientSecret: session.client_secret });
-  } catch (err) {
-    console.error('Error creando sesión de checkout:', err.message);
-    res.status(500).json({ error: 'No se pudo crear la sesión de pago' });
-  }
-});
-
-app.get('/verificar-pago', async (req, res) => {
-  const sessionId = req.query.session_id;
-
-  if (!sessionId) {
-    return res.status(400).json({ pagado: false, error: 'Falta session_id' });
-  }
-
-  try {
-    const session = await stripe.checkout.sessions.retrieve(sessionId);
-
-    if (session.payment_status !== 'paid') {
-      return res.json({ pagado: false });
+      default:
+        console.log('ℹ️ Evento sin handler:', event.type);
     }
 
-    // Confirmamos que el session_id sea realmente del producto de Visión
-    // Pecuaria, no de otro proyecto que comparta la misma cuenta de Stripe.
-    const lineItems = await stripe.checkout.sessions.listLineItems(sessionId, { limit: 10 });
-    const esDeEsteProyecto = lineItems.data.some(function(item){
-      return item.price && item.price.id === PRICE_ID_VISION_PECUARIA;
-    });
+    res.status(200).json({ received: true });
 
-    res.json({ pagado: esDeEsteProyecto });
   } catch (err) {
-    console.error('Error verificando sesión:', err.message);
-    res.status(400).json({ pagado: false, error: 'Sesión inválida o no encontrada' });
+    console.error('❌ Error procesando webhook:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-app.get('/', (req, res) => {
-  res.send('Webhook Visión Pecuaria funcionando correctamente.');
+// ═════════════════════════════════════════════════════════════════════════════
+// 4) CANCELACIÓN DIRECTA — llamada desde el panel VIP del portal
+// ═════════════════════════════════════════════════════════════════════════════
+app.post('/cancelar-membresia', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email requerido' });
+
+    const emailLower = email.toLowerCase().trim();
+    console.log('🛑 Cancelación solicitada por:', emailLower);
+
+    const miembro = await buscarMiembroPorEmail(emailLower);
+    if (!miembro) return res.status(404).json({ error: 'Miembro no encontrado' });
+
+    // Cancelar suscripción en Stripe si existe
+    const doc = await miembro.ref.get();
+    const subId = doc.data()?.stripeSubscriptionId;
+    if (subId) {
+      try {
+        await stripe.subscriptions.cancel(subId);
+        console.log('✅ Stripe subscription cancelled:', subId);
+      } catch (e) {
+        console.warn('⚠️ No se pudo cancelar en Stripe (tal vez ya estaba cancelada):', e.message);
+      }
+    }
+
+    await miembro.ref.update({
+      estado: 'inactivo',
+      canceladoEn: new Date().toISOString()
+    });
+
+    res.status(200).json({ success: true });
+
+  } catch (err) {
+    console.error('❌ Error cancelar-membresia:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.listen(PORT, () => {
-  console.log(`Servidor escuchando en el puerto ${PORT}`);
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 Visión Pecuaria Webhook (Stripe) running on port ${PORT}`));
