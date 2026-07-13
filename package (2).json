@@ -1,0 +1,17 @@
+{
+  "name": "webhook-visionpecuaria",
+  "version": "1.0.0",
+  "description": "Verificacion de pagos y envio de correo de acceso para el curso de Vision Pecuaria",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "stripe": "^16.8.0"
+  }
+}
