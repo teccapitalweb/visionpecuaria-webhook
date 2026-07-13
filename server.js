@@ -184,6 +184,9 @@ app.post('/crear-checkout-curso', async (req, res) => {
     if (!email) return res.status(400).json({ error: 'Email requerido' });
     if (!uid)   return res.status(400).json({ error: 'Debes iniciar sesión antes de comprar' });
     if (!slug)  return res.status(400).json({ error: 'Slug de curso requerido' });
+    if (!nombre || String(nombre).trim().length < 3) {
+      return res.status(400).json({ error: 'Nombre completo requerido para el certificado (mínimo 3 letras)' });
+    }
 
     // 1. Leer curso de Firestore (fuente única de verdad para precio)
     const cursoRef = db.collection('cursosVenta').doc(slug);
