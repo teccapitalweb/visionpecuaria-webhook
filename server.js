@@ -146,8 +146,16 @@ app.post('/crear-checkout-curso', async (req, res) => {
     // 3) ¿Ya compró este curso?
     if (uid) {
       const accesoSnap = await db.collection('accesosCurso').doc(uid).collection('cursos').doc(slug).get();
-      if (accesoSnap.exists && accesoSnap.data()?.estado === 'activo') {
-        return res.status(400).json({ yaComprado: true, error: 'Ya tienes acceso a este curso' });
+      if (accesoSnap.exists) {
+        const accesoData = accesoSnap.data();
+        const yaTieneAcceso = accesoData?.activo === true || accesoData?.estado === 'activo';
+        if (yaTieneAcceso) {
+          return res.status(400).json({
+            yaComprado: true,
+            error: 'Ya tienes acceso a este curso',
+            sessionId: accesoData?.stripeSessionId || null
+          });
+        }
       }
     }
 
@@ -247,31 +255,63 @@ app.post('/stripe-webhook', async (req, res) => {
             return res.status(200).json({ received: true });
           }
 
-          // Registrar acceso al curso
+          const fechaISO = new Date().toISOString();
+          const montoCentavos = session.amount_total || 0;
+
+          // 1) COMPRA por sessionId (lo que curso-acceso.html busca primero)
+          //    Esta colección se lee públicamente por session_id sin necesidad de auth
+          await db.collection('comprasCurso').doc(session.id).set({
+            sessionId: session.id,
+            slug,
+            uid: uid || null,
+            email,
+            nombre,
+            whatsapp,
+            estado: 'confirmado',
+            fechaCompra: fechaISO,
+            montoPagadoCentavos: montoCentavos,
+            stripeCustomerId: session.customer || null
+          }, { merge: true });
+          console.log(`✅ comprasCurso/${session.id} creado`);
+
+          // 2) ACCESO al curso por uid (para lista de cursos comprados)
           if (uid) {
             await db.collection('accesosCurso').doc(uid).collection('cursos').doc(slug).set({
               slug,
               email,
               nombre,
               whatsapp,
-              estado: 'activo',
-              fechaCompra: new Date().toISOString(),
+              activo: true,                         // ← formato que espera curso-acceso.html
+              estado: 'activo',                     // ← compatibilidad
+              fechaCompra: fechaISO,
               stripeSessionId: session.id,
-              montoPagadoCentavos: session.amount_total || 0
+              montoPagadoCentavos: montoCentavos
             }, { merge: true });
 
-            // Guardar datos del alumno bajo el uid
+            // Datos del alumno bajo el uid
             await db.collection('accesosCurso').doc(uid).set({
               email,
               nombre,
               whatsapp,
-              ultimaActualizacion: new Date().toISOString()
+              ultimaActualizacion: fechaISO
             }, { merge: true });
+            console.log(`✅ accesosCurso/${uid}/cursos/${slug} creado`);
           }
 
-          // Registrar pago
-          const monto = session.amount_total
-            ? (session.amount_total / 100).toFixed(2) + ' ' + (session.currency || 'MXN').toUpperCase()
+          // 3) INCREMENTAR cupo tomado del curso (para el contador de la landing)
+          try {
+            await db.collection('cursosVenta').doc(slug).update({
+              cupoLanzamientoTomados: admin.firestore.FieldValue.increment(1),
+              ultimoPago: fechaISO
+            });
+            console.log(`✅ cupo incrementado en cursosVenta/${slug}`);
+          } catch (e) {
+            console.warn(`⚠️ No se pudo incrementar cupo: ${e.message}`);
+          }
+
+          // 4) Registrar en pagos
+          const monto = montoCentavos
+            ? (montoCentavos / 100).toFixed(2) + ' ' + (session.currency || 'MXN').toUpperCase()
             : '—';
           await db.collection('pagos').add({
             tipo: 'curso',
@@ -279,18 +319,18 @@ app.post('/stripe-webhook', async (req, res) => {
             nombre, email, whatsapp,
             monto,
             stripeSessionId: session.id,
-            fecha: new Date().toISOString(),
+            fecha: fechaISO,
             estado: 'confirmado'
           });
 
-          // Pendiente de certificado (para que IPCIL lo emita después)
+          // 5) Certificado pendiente (para IPCIL)
           await db.collection('certificadosPendientes').add({
             slug,
             uid: uid || null,
             nombre,
             email,
             whatsapp,
-            fechaCompra: new Date().toISOString(),
+            fechaCompra: fechaISO,
             estado: 'pendiente',
             stripeSessionId: session.id
           });
