@@ -219,6 +219,94 @@ app.get('/verificar-session/:sessionId', async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// 2.b) VERIFICAR SESSION DE CURSO — llamado por curso-acceso.html
+//      GET /verificar-session-curso?session_id=cs_live_XXX&slug=gallinas-de-postura
+//      Devuelve { ok: true, slug, nombre, email, whatsapp } si el pago existe
+// ═════════════════════════════════════════════════════════════════════════════
+app.get('/verificar-session-curso', async (req, res) => {
+  try {
+    const { session_id, slug } = req.query;
+
+    if (!session_id) {
+      return res.json({ ok: false, error: 'session_id requerido' });
+    }
+
+    // 1) Buscar en comprasCurso (fuente principal de verdad)
+    const compraSnap = await db.collection('comprasCurso').doc(session_id).get();
+    if (compraSnap.exists) {
+      const compra = compraSnap.data();
+      if (slug && compra.slug && compra.slug !== slug) {
+        return res.json({ ok: false, error: 'Este pago no corresponde a este curso' });
+      }
+      if (compra.estado && compra.estado !== 'confirmado') {
+        return res.json({ ok: false, error: 'Pago no confirmado aún' });
+      }
+      return res.json({
+        ok: true,
+        slug: compra.slug,
+        nombre: compra.nombre || '',
+        email: compra.email || '',
+        whatsapp: compra.whatsapp || '',
+        fechaCompra: compra.fechaCompra || null,
+        montoPagadoCentavos: compra.montoPagadoCentavos || 0
+      });
+    }
+
+    // 2) Fallback: consultar directamente a Stripe.
+    //    Útil para pagos hechos antes de que el webhook actual estuviera desplegado,
+    //    o si el webhook aún no ha procesado el evento (race condition).
+    try {
+      const session = await stripe.checkout.sessions.retrieve(session_id);
+      if (session.payment_status !== 'paid') {
+        return res.json({ ok: false, error: 'Pago no completado en Stripe' });
+      }
+      const meta = session.metadata || {};
+      if (slug && meta.slug && meta.slug !== slug) {
+        return res.json({ ok: false, error: 'Este pago no corresponde a este curso' });
+      }
+      // Como no había registro, lo creamos ahora (recuperación automática)
+      const email = (session.customer_email || session.customer_details?.email || '').toLowerCase().trim();
+      const compraRecuperada = {
+        sessionId: session.id,
+        slug: meta.slug || slug || null,
+        uid: meta.uid || null,
+        email,
+        nombre: meta.nombre || email.split('@')[0],
+        whatsapp: meta.whatsapp || session.customer_details?.phone || '',
+        estado: 'confirmado',
+        fechaCompra: new Date(session.created * 1000).toISOString(),
+        montoPagadoCentavos: session.amount_total || 0,
+        stripeCustomerId: session.customer || null,
+        recuperadoDesdeStripe: true
+      };
+      try {
+        await db.collection('comprasCurso').doc(session.id).set(compraRecuperada, { merge: true });
+        console.log(`♻️ Compra recuperada desde Stripe: ${session.id}`);
+      } catch (e) {
+        console.warn('No se pudo guardar la compra recuperada:', e.message);
+      }
+      return res.json({
+        ok: true,
+        slug: compraRecuperada.slug,
+        nombre: compraRecuperada.nombre,
+        email: compraRecuperada.email,
+        whatsapp: compraRecuperada.whatsapp,
+        fechaCompra: compraRecuperada.fechaCompra,
+        montoPagadoCentavos: compraRecuperada.montoPagadoCentavos,
+        _fromStripe: true
+      });
+    } catch (e) {
+      console.warn('No se pudo consultar sesión en Stripe:', e.message);
+    }
+
+    return res.json({ ok: false, error: 'Registro de pago no encontrado' });
+  } catch (err) {
+    console.error('❌ Error verificar-session-curso:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // 3) WEBHOOK STRIPE — actualizar Firestore cuando pasa algo
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/stripe-webhook', async (req, res) => {
