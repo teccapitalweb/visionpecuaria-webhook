@@ -16,9 +16,12 @@ const auth = admin.auth();
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 
-// Price IDs (en variables de entorno para poder cambiar sin tocar código)
+// Price IDs del club VIP (membresías)
 const PRICE_MENSUAL = process.env.STRIPE_PRICE_MENSUAL || 'price_1TPb9nPBgqsOPfUYOzCZpX42';
 const PRICE_ANUAL   = process.env.STRIPE_PRICE_ANUAL   || 'price_1TPbCQPBgqsOPfUYZhUk9OGQ';
+
+// URL pública del sitio (para return_url de Stripe)
+const SITIO_URL = process.env.SITIO_URL || 'https://visionpecuariamx.com';
 
 // ─── CORS global ─────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
@@ -50,21 +53,18 @@ async function buscarMiembroPorEmail(email) {
   return null;
 }
 
-// Health check
-app.get('/', (req, res) => res.json({ status: 'Visión Pecuaria Webhook OK 🐄', stripe: true }));
-
-// ═════════════════════════════════════════════════════════════════════════════
-// 1) CREAR CHECKOUT SESSION — Stripe Embedded
-// El frontend llama aquí y recibe un clientSecret que monta el formulario
-// ═════════════════════════════════════════════════════════════════════════════
-// Helper: limpia strings para que no rompan URLs ni metadata de Stripe
-// Stripe acepta UTF-8 en metadata, pero el problema viene en URLs.
-// Aquí limpiamos espacios extra y normalizamos.
+// Helper: limpia strings
 function sanearTexto(s) {
   if (!s) return '';
   return String(s).normalize('NFC').trim().slice(0, 500);
 }
 
+// Health check
+app.get('/', (req, res) => res.json({ status: 'Visión Pecuaria Webhook OK 🐄', stripe: true, cursos: true }));
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 1) CREAR CHECKOUT SESSION — Club VIP (mensual/anual)
+// ═════════════════════════════════════════════════════════════════════════════
 app.post('/crear-checkout', async (req, res) => {
   try {
     const { plan, email: emailRaw, uid, nombre, whatsapp } = req.body;
@@ -77,7 +77,6 @@ app.post('/crear-checkout', async (req, res) => {
 
     const priceId = plan === 'anual' ? PRICE_ANUAL : PRICE_MENSUAL;
 
-    // Sanear todos los strings que van a metadata (Stripe acepta UTF-8 pero limpiamos por seguridad)
     const nombreLimpio = sanearTexto(nombre);
     const whatsappLimpio = sanearTexto(whatsapp).replace(/\D/g, '');
     const uidLimpio = sanearTexto(uid);
@@ -88,28 +87,14 @@ app.post('/crear-checkout', async (req, res) => {
       line_items: [{ price: priceId, quantity: 1 }],
       customer_email: email,
       allow_promotion_codes: true,
-      metadata: {
-        uid: uidLimpio,
-        nombre: nombreLimpio,
-        whatsapp: whatsappLimpio,
-        plan
-      },
+      metadata: { uid: uidLimpio, nombre: nombreLimpio, whatsapp: whatsappLimpio, plan },
       subscription_data: {
-        metadata: {
-          uid: uidLimpio,
-          email,
-          nombre: nombreLimpio,
-          whatsapp: whatsappLimpio,
-          plan
-        }
+        metadata: { uid: uidLimpio, email, nombre: nombreLimpio, whatsapp: whatsappLimpio, plan }
       },
-      // MODIFICADO: return_url ahora apunta al portal de socio directamente.
-      // Así el usuario ve la animación de bienvenida sin pasar por la landing.
       return_url: 'https://teccapitalweb.github.io/VisionPecuaria/?pago_exitoso=1&session_id={CHECKOUT_SESSION_ID}'
     });
 
-    console.log('✅ Checkout session creada:', session.id, 'para', email);
-    // Devolvemos AMBOS: client_secret (para modo embedded) y url (por si el frontend usa redirect)
+    console.log('✅ Checkout session (club) creada:', session.id, 'para', email);
     res.json({
       clientSecret: session.client_secret,
       url: session.url || null,
@@ -123,15 +108,101 @@ app.post('/crear-checkout', async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 2) VERIFICAR SESSION — el frontend puede preguntar el estado después de pagar
+// 1.b) CREAR CHECKOUT SESSION — CURSOS INDIVIDUALES (nuevo)
+//     Recibe: { slug, uid, email, nombre, whatsapp }
+//     Devuelve: { clientSecret }
+// ═════════════════════════════════════════════════════════════════════════════
+app.post('/crear-checkout-curso', async (req, res) => {
+  try {
+    const { slug: slugRaw, uid: uidRaw, email: emailRaw, nombre: nombreRaw, whatsapp: whatsappRaw } = req.body;
+
+    const slug = sanearTexto(slugRaw);
+    const email = (emailRaw || '').toLowerCase().trim();
+    const uid = sanearTexto(uidRaw);
+    const nombre = sanearTexto(nombreRaw);
+    const whatsapp = sanearTexto(whatsappRaw).replace(/\D/g, '');
+
+    if (!slug)   return res.status(400).json({ error: 'Slug del curso requerido' });
+    if (!email)  return res.status(400).json({ error: 'Email requerido' });
+    if (!nombre) return res.status(400).json({ error: 'Nombre requerido' });
+
+    // 1) Leer el curso de Firestore
+    const cursoSnap = await db.collection('cursosVenta').doc(slug).get();
+    if (!cursoSnap.exists) {
+      return res.status(404).json({ error: 'Curso no encontrado: ' + slug });
+    }
+    const curso = cursoSnap.data();
+
+    if (curso.activo === false) {
+      return res.status(400).json({ error: 'Este curso no está disponible en este momento' });
+    }
+
+    // 2) Determinar precio (lanzamiento si aplica, si no el normal)
+    let montoCentavos = curso.precioLanzamientoCentavos ?? curso.precioNormalCentavos;
+    if (!montoCentavos && curso.precioLanzamiento) montoCentavos = Math.round(curso.precioLanzamiento * 100);
+    if (!montoCentavos && curso.precioNormal)     montoCentavos = Math.round(curso.precioNormal * 100);
+    if (!montoCentavos) return res.status(400).json({ error: 'El curso no tiene precio configurado' });
+
+    // 3) ¿Ya compró este curso?
+    if (uid) {
+      const accesoSnap = await db.collection('accesosCurso').doc(uid).collection('cursos').doc(slug).get();
+      if (accesoSnap.exists && accesoSnap.data()?.estado === 'activo') {
+        return res.status(400).json({ yaComprado: true, error: 'Ya tienes acceso a este curso' });
+      }
+    }
+
+    // 4) Crear Stripe Checkout Session (modo payment, no subscription)
+    const nombreCurso = curso.nombre || curso.titulo || 'Curso Visión Pecuaria';
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      ui_mode: 'embedded',
+      customer_email: email,
+      line_items: [{
+        price_data: {
+          currency: curso.moneda || 'mxn',
+          product_data: {
+            name: nombreCurso,
+            description: curso.subtitulo || 'Curso online Visión Pecuaria'
+          },
+          unit_amount: montoCentavos
+        },
+        quantity: 1
+      }],
+      allow_promotion_codes: true,
+      metadata: {
+        tipo: 'curso',
+        slug,
+        uid,
+        nombre,
+        whatsapp,
+        email
+      },
+      return_url: `${SITIO_URL}/curso-acceso.html?slug=${encodeURIComponent(slug)}&session_id={CHECKOUT_SESSION_ID}`
+    });
+
+    console.log(`✅ Checkout de curso creado: ${slug} para ${email} (${montoCentavos / 100})`);
+    res.json({
+      clientSecret: session.client_secret,
+      sessionId: session.id
+    });
+
+  } catch (err) {
+    console.error('❌ Error crear-checkout-curso:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 2) VERIFICAR SESSION
 // ═════════════════════════════════════════════════════════════════════════════
 app.get('/verificar-session/:sessionId', async (req, res) => {
   try {
     const session = await stripe.checkout.sessions.retrieve(req.params.sessionId);
     res.json({
       status: session.status,
-      payment_status: session.payment_status,
-      customer_email: session.customer_email
+      paymentStatus: session.payment_status,
+      customerEmail: session.customer_email || session.customer_details?.email,
+      metadata: session.metadata || {}
     });
   } catch (err) {
     console.error('❌ Error verificar-session:', err);
@@ -140,7 +211,7 @@ app.get('/verificar-session/:sessionId', async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 3) WEBHOOK STRIPE — recibe eventos y actualiza Firestore
+// 3) WEBHOOK STRIPE — actualizar Firestore cuando pasa algo
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/stripe-webhook', async (req, res) => {
   let event;
@@ -158,13 +229,79 @@ app.post('/stripe-webhook', async (req, res) => {
   try {
     switch (event.type) {
 
-      // ─── Pago exitoso — ACTIVAR membresía ─────────────────────────────────
+      // ─── Pago exitoso ─────────────────────────────────────────────────────
       case 'checkout.session.completed': {
         const session = event.data.object;
+        const tipo = session.metadata?.tipo || 'membresia';
+
+        // ── RAMA A: pago de CURSO individual (nuevo) ──
+        if (tipo === 'curso') {
+          const email = (session.customer_email || session.customer_details?.email || '').toLowerCase().trim();
+          const slug = session.metadata?.slug;
+          const nombre = session.metadata?.nombre || email.split('@')[0];
+          const whatsapp = session.metadata?.whatsapp || session.customer_details?.phone || '';
+          let uid = session.metadata?.uid;
+
+          if (!email || !slug) {
+            console.warn('⚠️ Curso: faltan email o slug en metadata');
+            return res.status(200).json({ received: true });
+          }
+
+          // Registrar acceso al curso
+          if (uid) {
+            await db.collection('accesosCurso').doc(uid).collection('cursos').doc(slug).set({
+              slug,
+              email,
+              nombre,
+              whatsapp,
+              estado: 'activo',
+              fechaCompra: new Date().toISOString(),
+              stripeSessionId: session.id,
+              montoPagadoCentavos: session.amount_total || 0
+            }, { merge: true });
+
+            // Guardar datos del alumno bajo el uid
+            await db.collection('accesosCurso').doc(uid).set({
+              email,
+              nombre,
+              whatsapp,
+              ultimaActualizacion: new Date().toISOString()
+            }, { merge: true });
+          }
+
+          // Registrar pago
+          const monto = session.amount_total
+            ? (session.amount_total / 100).toFixed(2) + ' ' + (session.currency || 'MXN').toUpperCase()
+            : '—';
+          await db.collection('pagos').add({
+            tipo: 'curso',
+            slug,
+            nombre, email, whatsapp,
+            monto,
+            stripeSessionId: session.id,
+            fecha: new Date().toISOString(),
+            estado: 'confirmado'
+          });
+
+          // Pendiente de certificado (para que IPCIL lo emita después)
+          await db.collection('certificadosPendientes').add({
+            slug,
+            uid: uid || null,
+            nombre,
+            email,
+            whatsapp,
+            fechaCompra: new Date().toISOString(),
+            estado: 'pendiente',
+            stripeSessionId: session.id
+          });
+
+          console.log(`✅ Curso activado: ${slug} para ${email}`);
+          break;
+        }
+
+        // ── RAMA B: membresía club VIP (comportamiento original) ──
         const email = (session.customer_email || session.customer_details?.email || '').toLowerCase().trim();
         const nombre = session.metadata?.nombre || session.customer_details?.name || email.split('@')[0];
-        // ═══ FIX: WhatsApp desde múltiples fuentes ═══
-        // Prioridad: 1) metadata (mandado por el frontend) → 2) usuarios_free → 3) Stripe phone
         let whatsapp = session.metadata?.whatsapp || '';
         const planKey = session.metadata?.plan || 'mensual';
         const plan = planKey === 'anual' ? 'VIP Anual' : 'VIP Mensual';
@@ -184,9 +321,7 @@ app.post('/stripe-webhook', async (req, res) => {
           try {
             const user = await auth.getUserByEmail(email);
             uid = user.uid;
-            console.log(`✅ UID recuperado de Firebase Auth: ${uid}`);
           } catch (e) {
-            console.warn(`⚠️ Usuario no existe en Firebase Auth para email: ${email}. Intentando crearlo automáticamente...`);
             try {
               const newUser = await auth.createUser({
                 email: email,
@@ -194,42 +329,27 @@ app.post('/stripe-webhook', async (req, res) => {
                 emailVerified: true
               });
               uid = newUser.uid;
-              console.log(`✅ Usuario creado automáticamente en Firebase Auth: ${uid}`);
             } catch (createError) {
               console.error(`❌ No se pudo crear usuario Auth: ${createError.message}`);
             }
           }
         }
 
-        // ═══ FIX: Si aún no tenemos WhatsApp, buscar en usuarios_free ═══
         if (!whatsapp && uid) {
           try {
             const freeDoc = await db.collection('usuarios_free').doc(uid).get();
             if (freeDoc.exists) {
               const freeData = freeDoc.data();
-              if (freeData.whatsapp) {
-                whatsapp = freeData.whatsapp;
-                console.log('📱 WhatsApp recuperado de usuarios_free:', whatsapp);
-              }
+              if (freeData.whatsapp) whatsapp = freeData.whatsapp;
             }
-          } catch (e) {
-            console.warn('⚠️ No se pudo leer usuarios_free:', e.message);
-          }
+          } catch (e) {}
         }
-
-        // Último fallback: el phone que Stripe pudo haber capturado
-        if (!whatsapp) {
-          whatsapp = session.customer_details?.phone || '';
-        }
+        if (!whatsapp) whatsapp = session.customer_details?.phone || '';
 
         const docId = uid || email;
         if (docId) {
-          console.log(`📝 Escribiendo en miembros/${docId} (uid: ${uid ? 'sí' : 'NO - usando email'})`);
           await db.collection('miembros').doc(docId).set({
-            nombre,
-            email,
-            whatsapp,
-            plan,
+            nombre, email, whatsapp, plan,
             estado: 'activo',
             vence: venceStr,
             fechaRegistro: new Date().toISOString(),
@@ -239,62 +359,46 @@ app.post('/stripe-webhook', async (req, res) => {
             uid: uid || null,
           }, { merge: true });
 
-            const monto = session.amount_total
-              ? (session.amount_total / 100).toFixed(2) + ' ' + (session.currency || 'MXN').toUpperCase()
-              : '—';
+          const monto = session.amount_total
+            ? (session.amount_total / 100).toFixed(2) + ' ' + (session.currency || 'MXN').toUpperCase()
+            : '—';
 
-            await db.collection('pagos').add({
-              nombre, email, plan, monto,
-              stripeSessionId: session.id,
-              stripeSubscriptionId: session.subscription,
-              fecha: new Date().toISOString(),
-              estado: 'confirmado'
-            });
+          await db.collection('pagos').add({
+            tipo: 'membresia',
+            nombre, email, plan, monto,
+            stripeSessionId: session.id,
+            stripeSubscriptionId: session.subscription,
+            fecha: new Date().toISOString(),
+            estado: 'confirmado'
+          });
 
-            console.log(`✅ Miembro activado: ${email} | Plan: ${plan} | Vence: ${venceStr}`);
-          } else {
-            console.error(`❌ CRÍTICO: Sin uid ni email para crear documento. Metadata: ${JSON.stringify(session.metadata)}`);
-          }
-          break;
+          console.log(`✅ Miembro activado: ${email} | Plan: ${plan}`);
         }
+        break;
+      }
 
-      // ─── Suscripción actualizada (ej. renovación automática) ──────────────
       case 'customer.subscription.updated': {
         const sub = event.data.object;
         const email = (sub.metadata?.email || '').toLowerCase().trim();
-
         if (email) {
           const m = await buscarMiembroPorEmail(email);
           if (m && m.userExists) {
             const nuevoEstado = sub.status === 'active' || sub.status === 'trialing' ? 'activo' : 'inactivo';
-
             const vence = new Date(sub.current_period_end * 1000);
             const venceStr = vence.toLocaleDateString('es-MX', { day: 'numeric', month: 'long', year: 'numeric' });
-
-            await m.ref.update({
-              estado: nuevoEstado,
-              vence: venceStr,
-              stripeSubscriptionId: sub.id
-            });
-            console.log(`🔁 Suscripción actualizada: ${email} → ${nuevoEstado}`);
+            await m.ref.update({ estado: nuevoEstado, vence: venceStr, stripeSubscriptionId: sub.id });
           }
         }
         break;
       }
 
-      // ─── Suscripción cancelada ────────────────────────────────────────────
       case 'customer.subscription.deleted': {
         const sub = event.data.object;
         const email = (sub.metadata?.email || '').toLowerCase().trim();
-
         if (email) {
           const m = await buscarMiembroPorEmail(email);
           if (m && m.userExists) {
-            await m.ref.update({
-              estado: 'inactivo',
-              canceladoEn: new Date().toISOString()
-            });
-            console.log('🛑 Membresía cancelada (Stripe):', email);
+            await m.ref.update({ estado: 'inactivo', canceladoEn: new Date().toISOString() });
           }
         }
         break;
@@ -313,38 +417,24 @@ app.post('/stripe-webhook', async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 4) CANCELACIÓN DIRECTA — llamada desde el panel VIP del portal
+// 4) CANCELACIÓN DIRECTA
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/cancelar-membresia', async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email requerido' });
-
     const emailLower = email.toLowerCase().trim();
-    console.log('🛑 Cancelación solicitada por:', emailLower);
-
     const miembro = await buscarMiembroPorEmail(emailLower);
     if (!miembro) return res.status(404).json({ error: 'Miembro no encontrado' });
 
-    // Cancelar suscripción en Stripe si existe
     const doc = await miembro.ref.get();
     const subId = doc.data()?.stripeSubscriptionId;
     if (subId) {
-      try {
-        await stripe.subscriptions.cancel(subId);
-        console.log('✅ Stripe subscription cancelled:', subId);
-      } catch (e) {
-        console.warn('⚠️ No se pudo cancelar en Stripe (tal vez ya estaba cancelada):', e.message);
-      }
+      try { await stripe.subscriptions.cancel(subId); }
+      catch (e) { console.warn('⚠️ No se pudo cancelar en Stripe:', e.message); }
     }
-
-    await miembro.ref.update({
-      estado: 'inactivo',
-      canceladoEn: new Date().toISOString()
-    });
-
+    await miembro.ref.update({ estado: 'inactivo', canceladoEn: new Date().toISOString() });
     res.status(200).json({ success: true });
-
   } catch (err) {
     console.error('❌ Error cancelar-membresia:', err);
     res.status(500).json({ error: err.message });
