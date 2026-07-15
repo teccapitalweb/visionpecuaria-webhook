@@ -23,6 +23,14 @@ const PRICE_ANUAL   = process.env.STRIPE_PRICE_ANUAL   || 'price_1TPbCQPBgqsOPfU
 // URL pública del sitio (para return_url de Stripe)
 const SITIO_URL = process.env.SITIO_URL || 'https://visionpecuariamx.com';
 
+// ─── Resend (envío de correos) ───────────────────────────────────────────────
+// La API key vive en Railway como RESEND_API_KEY.
+// El remitente vive en Railway como EMAIL_FROM (debe usar el dominio verificado
+// en Resend: visionpecuariamx.com). Ejemplo: "Visión Pecuaria <cursos@visionpecuariamx.com>"
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const EMAIL_FROM = process.env.EMAIL_FROM || 'Visión Pecuaria <cursos@visionpecuariamx.com>';
+const RESEND_REPLY_TO = process.env.RESEND_REPLY_TO || 'contacto@visionpecuariamx.com';
+
 // ─── CORS global ─────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -58,6 +66,155 @@ function sanearTexto(s) {
   if (!s) return '';
   return String(s).normalize('NFC').trim().slice(0, 500);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// EMAIL — Correo de bienvenida por curso (Resend)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Paletas por curso (fallback si el curso no tiene colorMarca en Firestore)
+const PALETAS_CURSO = {
+  'embutidos-artesanales': { primary: '#0f3d27', accent: '#d4a017', headerFrom: '#124019', headerTo: '#0d3016' },
+  'gallinas-de-postura':   { primary: '#b45309', accent: '#f59e0b', headerFrom: '#c2620a', headerTo: '#9a4a08' }
+};
+const PALETA_DEFAULT = { primary: '#0f3d27', accent: '#d4a017', headerFrom: '#124019', headerTo: '#0d3016' };
+
+// Aclara/oscurece un hex un porcentaje (para derivar tonos del header)
+function ajustarHex(hex, pct) {
+  const c = String(hex || '').replace('#', '');
+  if (!/^[0-9a-fA-F]{6}$/.test(c)) return hex;
+  const f = pct / 100;
+  const r = parseInt(c.substr(0, 2), 16), g = parseInt(c.substr(2, 2), 16), b = parseInt(c.substr(4, 2), 16);
+  const adj = (n) => {
+    const v = f >= 0 ? n + (255 - n) * f : n * (1 + f);
+    return Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0');
+  };
+  return '#' + adj(r) + adj(g) + adj(b);
+}
+
+// Construye el HTML del correo de bienvenida
+function construirEmailCurso({ nombre, nombreCurso, ponente, sessionId, slug, colorMarca }) {
+  // Determinar paleta: colorMarca del curso > paleta predefinida > default
+  let paleta;
+  if (colorMarca && /^#?[0-9a-fA-F]{6}$/.test(colorMarca)) {
+    const base = colorMarca.startsWith('#') ? colorMarca : '#' + colorMarca;
+    paleta = { primary: base, accent: '#d4a017', headerFrom: ajustarHex(base, 8), headerTo: ajustarHex(base, -20) };
+  } else {
+    paleta = PALETAS_CURSO[slug] || PALETA_DEFAULT;
+  }
+
+  const linkAcceso = `${SITIO_URL}/curso-acceso.html?slug=${encodeURIComponent(slug)}&session_id=${encodeURIComponent(sessionId)}`;
+  const primerNombre = (nombre || '').split(' ')[0] || 'alumno';
+  const lineaPonente = ponente
+    ? `<p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#4b5563;">Impartido por <b style="color:#1f2937;">${ponente}</b>.</p>`
+    : '';
+
+  return `<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:24px 12px;">
+    <tr><td align="center">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.08);">
+
+        <!-- Header -->
+        <tr><td style="background:linear-gradient(135deg,${paleta.headerFrom},${paleta.headerTo});padding:36px 32px;text-align:center;">
+          <div style="color:${paleta.accent};font-size:12px;font-weight:700;letter-spacing:3px;text-transform:uppercase;margin-bottom:10px;">Visión Pecuaria</div>
+          <div style="color:#ffffff;font-size:24px;font-weight:800;line-height:1.25;">🎉 ¡Tu inscripción está confirmada!</div>
+        </td></tr>
+
+        <!-- Body -->
+        <tr><td style="padding:36px 32px;">
+          <p style="margin:0 0 18px;font-size:16px;color:#1f2937;">Hola <b>${primerNombre}</b>,</p>
+
+          <p style="margin:0 0 8px;font-size:15px;line-height:1.65;color:#374151;">
+            Bienvenido/a al curso <b style="color:#1f2937;">${nombreCurso}</b>. Tu pago se procesó correctamente y ya tienes
+            <b>acceso permanente</b> al contenido en video y a los materiales descargables.
+          </p>
+          ${lineaPonente}
+
+          <!-- Botón acceder -->
+          <table role="presentation" cellpadding="0" cellspacing="0" style="margin:28px 0 24px;">
+            <tr><td style="border-radius:12px;background:${paleta.primary};">
+              <a href="${linkAcceso}" style="display:inline-block;padding:15px 32px;color:#ffffff;font-size:16px;font-weight:700;text-decoration:none;border-radius:12px;">
+                🎬 Acceder al curso
+              </a>
+            </td></tr>
+          </table>
+
+          <!-- Nota certificado -->
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:12px;margin-top:8px;">
+            <tr><td style="padding:16px 18px;">
+              <div style="font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#6b7280;margin-bottom:6px;">📜 Sobre tu certificado</div>
+              <div style="font-size:14px;line-height:1.55;color:#4b5563;">
+                Tu certificado digital con folio válido IPCIL se te enviará por este medio
+                <b>aproximadamente una semana después</b> de que completes el curso. No necesitas hacer nada:
+                lo recibirás automáticamente.
+              </div>
+            </td></tr>
+          </table>
+
+          <p style="margin:24px 0 0;font-size:13px;line-height:1.6;color:#9ca3af;">
+            Si el botón no funciona, copia y pega este enlace en tu navegador:<br>
+            <a href="${linkAcceso}" style="color:${paleta.primary};word-break:break-all;">${linkAcceso}</a>
+          </p>
+        </td></tr>
+
+        <!-- Footer -->
+        <tr><td style="background:#f9fafb;padding:24px 32px;text-align:center;border-top:1px solid #e5e7eb;">
+          <div style="font-size:13px;color:#6b7280;margin-bottom:4px;">© 2026 <b style="color:#374151;">Visión Pecuaria</b> · Excelencia en producción animal</div>
+          <div style="font-size:12px;color:#9ca3af;">Este correo se envió porque te inscribiste a un curso en visionpecuariamx.com</div>
+        </td></tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+}
+
+// Envía el correo vía la API HTTP de Resend (sin dependencia npm, usa fetch nativo de Node 18+)
+async function enviarCorreoCurso({ email, nombre, nombreCurso, ponente, sessionId, slug, colorMarca }) {
+  if (!RESEND_API_KEY) {
+    console.warn('⚠️ RESEND_API_KEY no configurada — se omite el envío de correo');
+    return { ok: false, skipped: true };
+  }
+  if (!email) {
+    console.warn('⚠️ Sin email — se omite el envío de correo');
+    return { ok: false, skipped: true };
+  }
+
+  const html = construirEmailCurso({ nombre, nombreCurso, ponente, sessionId, slug, colorMarca });
+  const asunto = `🎉 ¡Bienvenido/a al curso ${nombreCurso}! Ya tienes acceso`;
+
+  try {
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        from: EMAIL_FROM,
+        to: [email],
+        reply_to: RESEND_REPLY_TO,
+        subject: asunto,
+        html
+      })
+    });
+
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      console.error(`❌ Resend respondió ${resp.status}:`, JSON.stringify(data));
+      return { ok: false, status: resp.status, data };
+    }
+    console.log(`📧 Correo enviado a ${email} (curso ${slug}) — id ${data.id || '?'}`);
+    return { ok: true, id: data.id };
+  } catch (err) {
+    console.error('❌ Error enviando correo con Resend:', err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
 
 // Health check
 app.get('/', (req, res) => res.json({ status: 'Visión Pecuaria Webhook OK 🐄', stripe: true, cursos: true }));
@@ -422,6 +579,28 @@ app.post('/stripe-webhook', async (req, res) => {
             estado: 'pendiente',
             stripeSessionId: session.id
           });
+
+          // 6) Correo de bienvenida (Resend) — datos del curso desde Firestore
+          try {
+            let nombreCurso = slug;
+            let ponente = '';
+            let colorMarca = null;
+            try {
+              const cursoDoc = await db.collection('cursosVenta').doc(slug).get();
+              if (cursoDoc.exists) {
+                const c = cursoDoc.data();
+                nombreCurso = c.nombre || c.titulo || slug;
+                ponente = c.instructorNombre || '';
+                colorMarca = c.colorMarca || null;
+              }
+            } catch (e) {
+              console.warn(`⚠️ No se pudo leer el curso para el correo: ${e.message}`);
+            }
+            await enviarCorreoCurso({ email, nombre, nombreCurso, ponente, sessionId: session.id, slug, colorMarca });
+          } catch (e) {
+            // El correo nunca debe tumbar el webhook: si falla, el acceso ya quedó guardado
+            console.error(`⚠️ Falló el envío de correo (acceso ya activado): ${e.message}`);
+          }
 
           console.log(`✅ Curso activado: ${slug} para ${email}`);
           break;
