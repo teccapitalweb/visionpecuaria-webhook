@@ -35,7 +35,7 @@ const RESEND_REPLY_TO = process.env.RESEND_REPLY_TO || 'contacto@visionpecuariam
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, stripe-signature');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, stripe-signature');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
@@ -224,10 +224,22 @@ app.get('/', (req, res) => res.json({ status: 'Visión Pecuaria Webhook OK 🐄'
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/crear-checkout', async (req, res) => {
   try {
-    const { plan, email: emailRaw, uid, nombre, whatsapp } = req.body;
-    const email = (emailRaw || '').toLowerCase().trim();
+    const authorization = req.get('authorization') || '';
+    const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
+    if (!token) return res.status(401).json({ error: 'Sesión requerida' });
 
-    if (!email) return res.status(400).json({ error: 'Email requerido' });
+    let usuario;
+    try {
+      usuario = await auth.verifyIdToken(token);
+    } catch (e) {
+      return res.status(401).json({ error: 'Sesión inválida o vencida' });
+    }
+
+    const { plan, nombre, whatsapp } = req.body;
+    const email = (usuario.email || '').toLowerCase().trim();
+    const uid = usuario.uid;
+
+    if (!email) return res.status(400).json({ error: 'La cuenta no tiene email' });
     if (!plan || !['mensual', 'anual'].includes(plan)) {
       return res.status(400).json({ error: 'Plan inválido (mensual|anual)' });
     }
