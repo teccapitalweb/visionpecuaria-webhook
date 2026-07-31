@@ -32,11 +32,28 @@ const EMAIL_FROM = process.env.EMAIL_FROM || 'Visión Pecuaria <cursos@visionpec
 const RESEND_REPLY_TO = process.env.RESEND_REPLY_TO || 'contacto@visionpecuariamx.com';
 
 // ─── CORS global ─────────────────────────────────────────────────────────────
+// Solo los frontends oficiales pueden invocar el API desde un navegador.
+// Los webhooks de Stripe no envían Origin y siguen funcionando normalmente.
+const ORIGENES_PERMITIDOS = new Set([
+  'https://visionpecuariamx.com',
+  'https://www.visionpecuariamx.com',
+  'https://teccapitalweb.github.io',
+  'http://127.0.0.1:8765',
+  'http://localhost:8765'
+]);
+
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  const origin = req.get('origin');
+  if (origin && ORIGENES_PERMITIDOS.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, stripe-signature');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  if (req.method === 'OPTIONS') {
+    if (origin && !ORIGENES_PERMITIDOS.has(origin)) return res.sendStatus(403);
+    return res.sendStatus(204);
+  }
   next();
 });
 
@@ -65,6 +82,68 @@ async function buscarMiembroPorEmail(email) {
 function sanearTexto(s) {
   if (!s) return '';
   return String(s).normalize('NFC').trim().slice(0, 500);
+}
+
+async function autenticarSolicitud(req, res) {
+  const authorization = req.get('authorization') || '';
+  const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
+  if (!token) {
+    res.status(401).json({ error: 'Sesión requerida' });
+    return null;
+  }
+  try {
+    return await auth.verifyIdToken(token);
+  } catch (e) {
+    res.status(401).json({ error: 'Sesión inválida o vencida' });
+    return null;
+  }
+}
+
+function fechaFirestoreAFecha(valor) {
+  if (!valor) return null;
+  if (typeof valor.toDate === 'function') return valor.toDate();
+  if (typeof valor.seconds === 'number') return new Date(valor.seconds * 1000);
+  const fecha = new Date(valor);
+  return Number.isNaN(fecha.getTime()) ? null : fecha;
+}
+
+function membresiaVigente(datos) {
+  if (!datos) return false;
+  if (datos.estado === 'activo') return true;
+  const fin = fechaFirestoreAFecha(datos.fechaFin);
+  return datos.cancelado === true && fin && fin > new Date();
+}
+
+function cursoParaCatalogo(doc) {
+  const datos = doc.data() || {};
+  const clases = Array.isArray(datos.clases) ? datos.clases : [];
+  const esMuestra = Number(datos.ordenDrip) === 1;
+  return {
+    id: doc.id,
+    titulo: datos.titulo || 'Curso',
+    instructor: datos.instructor || 'Visión Pecuaria',
+    categoria: datos.categoria || 'General',
+    descripcion: datos.descripcion || '',
+    foto: datos.foto || '',
+    ordenDrip: datos.ordenDrip || 999,
+    diasDrip: datos.diasDrip || 8,
+    clases: clases.map((clase, indice) => {
+      const publica = {
+        titulo: clase?.titulo || `Clase ${indice + 1}`,
+        duracion: clase?.duracion || ''
+      };
+      // La única reproducción gratuita autorizada es la clase 1 del curso
+      // marcado como muestra. Ningún otro URL/ID sale en el catálogo.
+      if (esMuestra && indice === 0) {
+        publica.url = clase?.url || '';
+        publica.videoUrl = clase?.videoUrl || '';
+        publica.bunnyLibraryId = clase?.bunnyLibraryId || '';
+        publica.bunnyVideoId = clase?.bunnyVideoId || '';
+        publica.bunnyActivo = clase?.bunnyActivo !== false;
+      }
+      return publica;
+    })
+  };
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -216,6 +295,40 @@ async function enviarCorreoCurso({ email, nombre, nombreCurso, ponente, sessionI
 }
 
 
+// Catálogo sin secretos de reproducción. Lo usan las vitrinas FREE y Progreso.
+app.get('/catalogo-cursos', async (req, res) => {
+  try {
+    const snap = await db.collection('cursos').get();
+    const cursos = snap.docs.map(cursoParaCatalogo)
+      .sort((a, b) => (a.ordenDrip || 999) - (b.ordenDrip || 999));
+    res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=300');
+    res.json({ cursos });
+  } catch (err) {
+    console.error('❌ Error catalogo-cursos:', err);
+    res.status(500).json({ error: 'No se pudo cargar el catálogo' });
+  }
+});
+
+// Contenido completo: solo para el dueño de una membresía vigente.
+app.get('/cursos-membresia', async (req, res) => {
+  try {
+    const usuario = await autenticarSolicitud(req, res);
+    if (!usuario) return;
+    const miembro = await db.collection('miembros').doc(usuario.uid).get();
+    if (!miembro.exists || !membresiaVigente(miembro.data())) {
+      return res.status(403).json({ error: 'Membresía Élite vigente requerida' });
+    }
+    const snap = await db.collection('cursos').get();
+    const cursos = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }))
+      .sort((a, b) => (a.ordenDrip || 999) - (b.ordenDrip || 999));
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json({ cursos });
+  } catch (err) {
+    console.error('❌ Error cursos-membresia:', err);
+    res.status(500).json({ error: 'No se pudieron cargar los cursos' });
+  }
+});
+
 // Health check
 app.get('/', (req, res) => res.json({ status: 'Visión Pecuaria Webhook OK 🐄', stripe: true, cursos: true }));
 
@@ -224,16 +337,8 @@ app.get('/', (req, res) => res.json({ status: 'Visión Pecuaria Webhook OK 🐄'
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/crear-checkout', async (req, res) => {
   try {
-    const authorization = req.get('authorization') || '';
-    const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
-    if (!token) return res.status(401).json({ error: 'Sesión requerida' });
-
-    let usuario;
-    try {
-      usuario = await auth.verifyIdToken(token);
-    } catch (e) {
-      return res.status(401).json({ error: 'Sesión inválida o vencida' });
-    }
+    const usuario = await autenticarSolicitud(req, res);
+    if (!usuario) return;
 
     const { plan, nombre, whatsapp } = req.body;
     const email = (usuario.email || '').toLowerCase().trim();
@@ -242,6 +347,11 @@ app.post('/crear-checkout', async (req, res) => {
     if (!email) return res.status(400).json({ error: 'La cuenta no tiene email' });
     if (!plan || !['mensual', 'anual'].includes(plan)) {
       return res.status(400).json({ error: 'Plan inválido (mensual|anual)' });
+    }
+
+    const miembroActual = await db.collection('miembros').doc(uid).get();
+    if (miembroActual.exists && membresiaVigente(miembroActual.data())) {
+      return res.status(409).json({ error: 'Tu cuenta ya tiene una membresía Élite vigente' });
     }
 
     const priceId = plan === 'anual' ? PRICE_ANUAL : PRICE_MENSUAL;
@@ -728,7 +838,14 @@ app.post('/stripe-webhook', async (req, res) => {
             const nuevoEstado = sub.status === 'active' || sub.status === 'trialing' ? 'activo' : 'inactivo';
             const vence = new Date(sub.current_period_end * 1000);
             const venceStr = vence.toLocaleDateString('es-MX', { day: 'numeric', month: 'long', year: 'numeric' });
-            await m.ref.update({ estado: nuevoEstado, vence: venceStr, stripeSubscriptionId: sub.id });
+            await m.ref.update({
+              estado: nuevoEstado,
+              vence: venceStr,
+              fechaFin: admin.firestore.Timestamp.fromMillis(sub.current_period_end * 1000),
+              stripeSubscriptionId: sub.id,
+              cancelado: Boolean(sub.cancel_at_period_end),
+              cancelarAlFinal: Boolean(sub.cancel_at_period_end)
+            });
           }
         }
         break;
@@ -759,24 +876,45 @@ app.post('/stripe-webhook', async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 4) CANCELACIÓN DIRECTA
+// 4) CANCELACIÓN DIRECTA Y SEGURA
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/cancelar-membresia', async (req, res) => {
   try {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: 'Email requerido' });
-    const emailLower = email.toLowerCase().trim();
-    const miembro = await buscarMiembroPorEmail(emailLower);
-    if (!miembro) return res.status(404).json({ error: 'Miembro no encontrado' });
+    const usuario = await autenticarSolicitud(req, res);
+    if (!usuario) return;
 
-    const doc = await miembro.ref.get();
-    const subId = doc.data()?.stripeSubscriptionId;
-    if (subId) {
-      try { await stripe.subscriptions.cancel(subId); }
-      catch (e) { console.warn('⚠️ No se pudo cancelar en Stripe:', e.message); }
+    // El UID sale exclusivamente del token de Firebase. Nunca se permite
+    // cancelar una cuenta indicando un correo arbitrario en el body.
+    const ref = db.collection('miembros').doc(usuario.uid);
+    const doc = await ref.get();
+    if (!doc.exists) return res.status(404).json({ error: 'No encontramos una membresía activa en tu cuenta' });
+
+    const datos = doc.data() || {};
+    const subId = datos.stripeSubscriptionId;
+    if (!subId) return res.status(409).json({ error: 'Esta membresía no tiene una suscripción de Stripe asociada' });
+
+    const suscripcion = await stripe.subscriptions.retrieve(subId);
+    if (suscripcion.status === 'canceled') {
+      return res.status(409).json({ error: 'La suscripción ya está cancelada' });
     }
-    await miembro.ref.update({ estado: 'inactivo', canceladoEn: new Date().toISOString() });
-    res.status(200).json({ success: true });
+
+    const actualizada = suscripcion.cancel_at_period_end
+      ? suscripcion
+      : await stripe.subscriptions.update(subId, { cancel_at_period_end: true });
+    const fechaFin = admin.firestore.Timestamp.fromMillis(actualizada.current_period_end * 1000);
+
+    await ref.update({
+      estado: 'activo',
+      cancelado: true,
+      cancelarAlFinal: true,
+      fechaFin,
+      canceladoEn: new Date().toISOString()
+    });
+
+    res.status(200).json({
+      success: true,
+      accesoHasta: new Date(actualizada.current_period_end * 1000).toISOString()
+    });
   } catch (err) {
     console.error('❌ Error cancelar-membresia:', err);
     res.status(500).json({ error: err.message });
