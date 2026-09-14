@@ -1,6 +1,7 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const Stripe = require('stripe');
+const { orderedCourses, publicCatalog } = require('./course-policy');
 
 const app = express();
 
@@ -112,38 +113,6 @@ function membresiaVigente(datos) {
   if (datos.estado === 'activo') return true;
   const fin = fechaFirestoreAFecha(datos.fechaFin);
   return datos.cancelado === true && fin && fin > new Date();
-}
-
-function cursoParaCatalogo(doc) {
-  const datos = doc.data() || {};
-  const clases = Array.isArray(datos.clases) ? datos.clases : [];
-  const esMuestra = Number(datos.ordenDrip) === 1;
-  return {
-    id: doc.id,
-    titulo: datos.titulo || 'Curso',
-    instructor: datos.instructor || 'Visión Pecuaria',
-    categoria: datos.categoria || 'General',
-    descripcion: datos.descripcion || '',
-    foto: datos.foto || '',
-    ordenDrip: datos.ordenDrip || 999,
-    diasDrip: datos.diasDrip || 8,
-    clases: clases.map((clase, indice) => {
-      const publica = {
-        titulo: clase?.titulo || `Clase ${indice + 1}`,
-        duracion: clase?.duracion || ''
-      };
-      // La única reproducción gratuita autorizada es la clase 1 del curso
-      // marcado como muestra. Ningún otro URL/ID sale en el catálogo.
-      if (esMuestra && indice === 0) {
-        publica.url = clase?.url || '';
-        publica.videoUrl = clase?.videoUrl || '';
-        publica.bunnyLibraryId = clase?.bunnyLibraryId || '';
-        publica.bunnyVideoId = clase?.bunnyVideoId || '';
-        publica.bunnyActivo = clase?.bunnyActivo !== false;
-      }
-      return publica;
-    })
-  };
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -299,8 +268,7 @@ async function enviarCorreoCurso({ email, nombre, nombreCurso, ponente, sessionI
 app.get('/catalogo-cursos', async (req, res) => {
   try {
     const snap = await db.collection('cursos').get();
-    const cursos = snap.docs.map(cursoParaCatalogo)
-      .sort((a, b) => (a.ordenDrip || 999) - (b.ordenDrip || 999));
+    const cursos = publicCatalog(snap.docs.map(doc => ({ ...doc.data(), id: doc.id })));
     res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=300');
     res.json({ cursos });
   } catch (err) {
@@ -319,8 +287,7 @@ app.get('/cursos-membresia', async (req, res) => {
       return res.status(403).json({ error: 'Membresía Élite vigente requerida' });
     }
     const snap = await db.collection('cursos').get();
-    const cursos = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }))
-      .sort((a, b) => (a.ordenDrip || 999) - (b.ordenDrip || 999));
+    const cursos = orderedCourses(snap.docs.map(doc => ({ ...doc.data(), id: doc.id })));
     res.setHeader('Cache-Control', 'private, no-store');
     res.json({ cursos });
   } catch (err) {
