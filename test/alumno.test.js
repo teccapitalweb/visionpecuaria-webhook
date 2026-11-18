@@ -291,3 +291,93 @@ test('checkout: "ya comprado" no devuelve el sessionId', async () => {
   assert.equal(r.data.yaComprado, true);
   assert.equal(r.data.sessionId, null);
 });
+
+// ─── Bunny + solicitudes de certificado ─────────────────────────────────────
+const G1 = '573d362b-7d72-4292-a568-e60089854555';
+const G2 = 'f7a42c9b-46c4-4296-8388-7951a3784d8d';
+
+test('certificado: alumno con acceso solicita; datos inválidos → 400; sin acceso → 403', async () => {
+  const mal = await api('/alumno/curso/gallinas-de-postura/certificado/solicitar', { token: 'tGallinas', method: 'POST', body: { nombreCompleto: 'Juan', whatsapp: '123', estado: '' } });
+  assert.equal(mal.status, 400);
+  const ok = await api('/alumno/curso/gallinas-de-postura/certificado/solicitar', { token: 'tGallinas', method: 'POST',
+    body: { nombreCompleto: 'Juan Pérez López <b>', whatsapp: '238 123 4567', estado: 'Puebla', ciudad: 'Tehuacán', ocupacion: 'Productor' } });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.data.solicitud.estado, 'pendiente');
+  const doc = db._get('solicitudesCertificado/u-gallinas_gallinas-de-postura');
+  assert.equal(doc.nombreCompleto, 'Juan Pérez López b');
+  assert.equal(doc.whatsapp, '2381234567');
+  assert.equal(doc.estadoRep, 'Puebla');
+  assert.equal(doc.slug, 'gallinas-de-postura');
+  assert.ok(doc.fechaSolicitud);
+  const det = await api('/alumno/curso/gallinas-de-postura', { token: 'tGallinas' });
+  assert.equal(det.data.solicitudCertificado.estado, 'pendiente');
+  const no = await api('/alumno/curso/gallinas-de-postura/certificado/solicitar', { token: 'tOtro', method: 'POST', body: { nombreCompleto: 'Otro Señor', whatsapp: '2381234567', estado: 'Puebla' } });
+  assert.equal(no.status, 403);
+});
+
+test('certificado: reenviar conserva la fecha original; admin lista y marca emitido; ya emitido → 409', async () => {
+  const antes = db._get('solicitudesCertificado/u-gallinas_gallinas-de-postura').fechaSolicitud;
+  await new Promise(r => setTimeout(r, 5));
+  await api('/alumno/curso/gallinas-de-postura/certificado/solicitar', { token: 'tGallinas', method: 'POST', body: { nombreCompleto: 'Juan Pérez López', whatsapp: '2381234567', estado: 'Puebla' } });
+  assert.equal(db._get('solicitudesCertificado/u-gallinas_gallinas-de-postura').fechaSolicitud, antes);
+  const noAdmin = await api('/admin/certificados/solicitudes', { token: 'tGallinas' });
+  assert.equal(noAdmin.status, 403);
+  const lista = await api('/admin/certificados/solicitudes', { token: 'tAdmin' });
+  assert.equal(lista.status, 200);
+  const s = lista.data.solicitudes.find(x => x.id === 'u-gallinas_gallinas-de-postura');
+  assert.equal(s.cursoNombre, 'Manejo profesional de gallinas de postura');
+  const mal = await api('/admin/certificados/solicitudes/estado', { token: 'tAdmin', method: 'POST', body: { id: s.id, estado: 'aprobadisimo' } });
+  assert.equal(mal.status, 400);
+  const em = await api('/admin/certificados/solicitudes/estado', { token: 'tAdmin', method: 'POST', body: { id: s.id, estado: 'emitido', folio: 'VP-2026-0001' } });
+  assert.equal(em.status, 200);
+  assert.equal(db._get('solicitudesCertificado/u-gallinas_gallinas-de-postura').folio, 'VP-2026-0001');
+  assert.ok(db.dump('auditoriaCursos').some(a => a.accion === 'solicitud-certificado'));
+  const otra = await api('/alumno/curso/gallinas-de-postura/certificado/solicitar', { token: 'tGallinas', method: 'POST', body: { nombreCompleto: 'Juan Pérez López', whatsapp: '2381234567', estado: 'Puebla' } });
+  assert.equal(otra.status, 409);
+});
+
+test('bunny: solo admin; valida biblioteca e IDs; conserva ids de clase y quita Drive', async () => {
+  const noAdmin = await api('/admin/cursos/contenido-bunny', { token: 'tGallinas', method: 'POST', body: { slug: 'gallinas-de-postura', biblioteca: '123', videos: [] } });
+  assert.equal(noAdmin.status, 403);
+  const mala = await api('/admin/cursos/contenido-bunny', { token: 'tAdmin', method: 'POST', body: { slug: 'gallinas-de-postura', biblioteca: 'abc', videos: [] } });
+  assert.equal(mala.status, 400);
+  const malId = await api('/admin/cursos/contenido-bunny', { token: 'tAdmin', method: 'POST', body: { slug: 'gallinas-de-postura', biblioteca: '555', videos: [{ orden: 1, id: 'no-es-guid' }] } });
+  assert.equal(malId.status, 400);
+  const ok = await api('/admin/cursos/contenido-bunny', { token: 'tAdmin', method: 'POST', body: {
+    slug: 'gallinas-de-postura', biblioteca: '555', cdn: 'vz-abc123.b-cdn.net',
+    videos: [{ orden: 1, id: G1, duracionSeg: 3600 }, { orden: 3, id: G2 }] } });
+  assert.equal(ok.status, 200);
+  const priv = db._get('cursosContenidoPrivado/gallinas-de-postura');
+  assert.equal(priv.proveedorVideo, 'bunny');
+  assert.ok(!/drive\.google/.test(JSON.stringify(priv.clases)));
+  assert.deepEqual(priv.clases.map(c => c.id), ['c1', 'c2', 'c3']);
+  assert.equal(priv.clases[1].estado, 'pendiente');       // sin video → pendiente
+  assert.ok(!priv.clases[2].estado);                        // la 3 tenía video nuevo → publicada
+  assert.equal(priv.clases[0].duracionMin, 60);
+  // público intacto
+  assert.match(JSON.stringify(db._get('cursosVenta/gallinas-de-postura').clases), /AAA111/);
+});
+
+test('bunny: el alumno recibe el reproductor de Bunny y miniatura del CDN; sin fuentes en el listado', async () => {
+  const det = await api('/alumno/curso/gallinas-de-postura', { token: 'tGallinas' });
+  assert.deepEqual(det.data.clases.map(c => c.estado), ['publicada', 'pendiente', 'publicada']);
+  assert.equal(det.data.clases[0].miniatura, `https://vz-abc123.b-cdn.net/${G1}/thumbnail.jpg`);
+  assert.ok(!/mediadelivery|"bunny"/.test(JSON.stringify(det.data)));
+  const v = await api('/alumno/curso/gallinas-de-postura/video', { token: 'tGallinas', method: 'POST', body: { claseId: 'c1' } });
+  assert.equal(v.data.tipo, 'iframe');
+  assert.equal(v.data.proveedor, 'bunny');
+  assert.ok(v.data.url.startsWith(`https://iframe.mediadelivery.net/embed/555/${G1}?`));
+  const no = await api('/alumno/curso/gallinas-de-postura/video', { token: 'tOtro', method: 'POST', body: { claseId: 'c1' } });
+  assert.equal(no.status, 403);
+});
+
+test('bunny: firma del reproductor cuando hay llave (sha256 de llave+id+expira)', () => {
+  const { urlBunny, bunnyDe } = require('../alumno')._internos;
+  const b = bunnyDe({ bunny: { biblioteca: '555', id: G1 } });
+  const url = urlBunny(b, 'llave-secreta', 1_800_000_000_000, 3600);
+  const exp = 1_800_000_000 + 3600;
+  const tok = crypto.createHash('sha256').update('llave-secreta' + G1 + exp).digest('hex');
+  assert.ok(url.includes(`token=${tok}`) && url.includes(`expires=${exp}`));
+  assert.ok(!urlBunny(b, '').includes('token='));
+  assert.equal(bunnyDe({ bunny: { biblioteca: '555', id: 'x' } }), null);
+});
