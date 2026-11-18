@@ -181,7 +181,8 @@ function construirEmailCurso({ nombre, nombreCurso, ponente, sessionId, slug, co
     paleta = PALETAS_CURSO[slug] || PALETA_DEFAULT;
   }
 
-  const linkAcceso = `${SITIO_URL}/curso-acceso.html?slug=${encodeURIComponent(slug)}&session_id=${encodeURIComponent(sessionId)}`;
+  // Aula permanente: el alumno entra con su correo verificado desde cualquier dispositivo
+  const linkAcceso = `${SITIO_URL}/aula/?curso=${encodeURIComponent(slug)}`;
   const primerNombre = (nombre || '').split(' ')[0] || 'alumno';
   const lineaPonente = ponente
     ? `<p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#4b5563;">Impartido por <b style="color:#1f2937;">${ponente}</b>.</p>`
@@ -219,6 +220,10 @@ function construirEmailCurso({ nombre, nombreCurso, ponente, sessionId, slug, co
               </a>
             </td></tr>
           </table>
+          <p style="margin:-8px 0 22px;font-size:13px;line-height:1.6;color:#6b7280;">
+            Entra con <b>este mismo correo</b> (con Google o creando tu contraseña). Así podrás volver a tus clases
+            desde cualquier dispositivo, también con el botón <b>«Ya compré · Entrar a mi curso»</b> de la página del curso.
+          </p>
 
           <!-- Nota certificado -->
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:12px;margin-top:8px;">
@@ -329,6 +334,9 @@ app.get('/cursos-membresia', async (req, res) => {
   }
 });
 
+// Aula del alumno + conciliación administrativa (ver alumno.js)
+require('./alumno').registrarRutasAlumno(app, { admin, db, auth, stripe });
+
 // Health check
 app.get('/', (req, res) => res.json({ status: 'Visión Pecuaria Webhook OK 🐄', stripe: true, cursos: true }));
 
@@ -432,7 +440,8 @@ app.post('/crear-checkout-curso', async (req, res) => {
           return res.status(400).json({
             yaComprado: true,
             error: 'Ya tienes acceso a este curso',
-            sessionId: accesoData?.stripeSessionId || null
+            // Sin sessionId: no se expone el registro de compra a quien solo conoce el correo
+            sessionId: null
           });
         }
       }
@@ -609,6 +618,169 @@ app.get('/verificar-session-curso', async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// Compra de CURSO individual — idempotente
+//   · Solo otorga acceso si Stripe reporta el pago como pagado
+//     (OXXO / pagos diferidos quedan 'pendiente' hasta async_payment_succeeded).
+//   · Un candado por sessionId evita duplicar pagos, cupos, certificados
+//     pendientes y correos cuando Stripe reenvía el evento.
+// ═════════════════════════════════════════════════════════════════════════════
+async function procesarCompraCurso(session) {
+  const pagado = session.payment_status === 'paid' || session.payment_status === 'no_payment_required';
+  if (!pagado) {
+    const ref = db.collection('comprasCurso').doc(session.id);
+    const prev = await ref.get();
+    if (!prev.exists || prev.data().estado !== 'confirmado') {
+      await ref.set({
+        sessionId: session.id,
+        slug: session.metadata?.slug || null,
+        uid: session.metadata?.uid || null,
+        email: (session.customer_email || session.customer_details?.email || '').toLowerCase().trim(),
+        nombre: session.metadata?.nombre || '',
+        whatsapp: session.metadata?.whatsapp || '',
+        estado: 'pendiente',
+        estadoPagoStripe: session.payment_status || null,
+        fechaCompra: new Date().toISOString(),
+        montoPagadoCentavos: session.amount_total || 0
+      }, { merge: true });
+    }
+    console.log(`⏳ Pago de curso pendiente (${session.payment_status}): ${session.id}`);
+    return;
+  }
+
+  const candado = db.collection('cursosProcesados').doc(session.id);
+  try {
+    await candado.create({ fecha: new Date().toISOString() });
+  } catch (e) {
+    if (e.code === 6 || /already exists/i.test(e.message || '')) {
+      console.log(`↩️ Compra de curso ya procesada, se ignora reenvío: ${session.id}`);
+      return;
+    }
+    throw e;
+  }
+
+  try {
+      const email = (session.customer_email || session.customer_details?.email || '').toLowerCase().trim();
+      const slug = session.metadata?.slug;
+      const nombre = session.metadata?.nombre || email.split('@')[0];
+      const whatsapp = session.metadata?.whatsapp || session.customer_details?.phone || '';
+      let uid = session.metadata?.uid;
+
+      if (!email || !slug) {
+        console.warn('⚠️ Curso: faltan email o slug en metadata');
+        return;
+      }
+
+      const fechaISO = new Date().toISOString();
+      const montoCentavos = session.amount_total || 0;
+
+      // 1) COMPRA por sessionId (lo que curso-acceso.html busca primero)
+      //    Esta colección se lee públicamente por session_id sin necesidad de auth
+      await db.collection('comprasCurso').doc(session.id).set({
+        sessionId: session.id,
+        slug,
+        uid: uid || null,
+        email,
+        nombre,
+        whatsapp,
+        estado: 'confirmado',
+        fechaCompra: fechaISO,
+        montoPagadoCentavos: montoCentavos,
+        stripeCustomerId: session.customer || null
+      }, { merge: true });
+      console.log(`✅ comprasCurso/${session.id} creado`);
+
+      // 2) ACCESO al curso por uid (para lista de cursos comprados)
+      if (uid) {
+        await db.collection('accesosCurso').doc(uid).collection('cursos').doc(slug).set({
+          slug,
+          email,
+          nombre,
+          whatsapp,
+          activo: true,                         // ← formato que espera curso-acceso.html
+          estado: 'activo',                     // ← compatibilidad
+          fechaCompra: fechaISO,
+          stripeSessionId: session.id,
+          montoPagadoCentavos: montoCentavos
+        }, { merge: true });
+
+        // Datos del alumno bajo el uid
+        await db.collection('accesosCurso').doc(uid).set({
+          email,
+          nombre,
+          whatsapp,
+          ultimaActualizacion: fechaISO
+        }, { merge: true });
+        console.log(`✅ accesosCurso/${uid}/cursos/${slug} creado`);
+      }
+
+      // 3) INCREMENTAR cupo tomado del curso (para el contador de la landing)
+      try {
+        await db.collection('cursosVenta').doc(slug).update({
+          cupoLanzamientoTomados: admin.firestore.FieldValue.increment(1),
+          ultimoPago: fechaISO
+        });
+        console.log(`✅ cupo incrementado en cursosVenta/${slug}`);
+      } catch (e) {
+        console.warn(`⚠️ No se pudo incrementar cupo: ${e.message}`);
+      }
+
+      // 4) Registrar en pagos
+      const monto = montoCentavos
+        ? (montoCentavos / 100).toFixed(2) + ' ' + (session.currency || 'MXN').toUpperCase()
+        : '—';
+      await db.collection('pagos').add({
+        tipo: 'curso',
+        slug,
+        nombre, email, whatsapp,
+        monto,
+        stripeSessionId: session.id,
+        fecha: fechaISO,
+        estado: 'confirmado'
+      });
+
+      // 5) Certificado pendiente (para IPCIL)
+      await db.collection('certificadosPendientes').add({
+        slug,
+        uid: uid || null,
+        nombre,
+        email,
+        whatsapp,
+        fechaCompra: fechaISO,
+        estado: 'pendiente',
+        stripeSessionId: session.id
+      });
+
+      // 6) Correo de bienvenida (Resend) — datos del curso desde Firestore
+      try {
+        let nombreCurso = slug;
+        let ponente = '';
+        let colorMarca = null;
+        try {
+          const cursoDoc = await db.collection('cursosVenta').doc(slug).get();
+          if (cursoDoc.exists) {
+            const c = cursoDoc.data();
+            nombreCurso = c.nombre || c.titulo || slug;
+            ponente = c.instructorNombre || '';
+            colorMarca = c.colorMarca || null;
+          }
+        } catch (e) {
+          console.warn(`⚠️ No se pudo leer el curso para el correo: ${e.message}`);
+        }
+        await enviarCorreoCurso({ email, nombre, nombreCurso, ponente, sessionId: session.id, slug, colorMarca });
+      } catch (e) {
+        // El correo nunca debe tumbar el webhook: si falla, el acceso ya quedó guardado
+        console.error(`⚠️ Falló el envío de correo (acceso ya activado): ${e.message}`);
+      }
+
+      console.log(`✅ Curso activado: ${slug} para ${email}`);
+  } catch (err) {
+    // Liberar el candado para que el reintento de Stripe vuelva a procesar
+    await candado.delete().catch(() => {});
+    throw err;
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // 3) WEBHOOK STRIPE — actualizar Firestore cuando pasa algo
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/stripe-webhook', async (req, res) => {
@@ -634,120 +806,7 @@ app.post('/stripe-webhook', async (req, res) => {
 
         // ── RAMA A: pago de CURSO individual (nuevo) ──
         if (tipo === 'curso') {
-          const email = (session.customer_email || session.customer_details?.email || '').toLowerCase().trim();
-          const slug = session.metadata?.slug;
-          const nombre = session.metadata?.nombre || email.split('@')[0];
-          const whatsapp = session.metadata?.whatsapp || session.customer_details?.phone || '';
-          let uid = session.metadata?.uid;
-
-          if (!email || !slug) {
-            console.warn('⚠️ Curso: faltan email o slug en metadata');
-            return res.status(200).json({ received: true });
-          }
-
-          const fechaISO = new Date().toISOString();
-          const montoCentavos = session.amount_total || 0;
-
-          // 1) COMPRA por sessionId (lo que curso-acceso.html busca primero)
-          //    Esta colección se lee públicamente por session_id sin necesidad de auth
-          await db.collection('comprasCurso').doc(session.id).set({
-            sessionId: session.id,
-            slug,
-            uid: uid || null,
-            email,
-            nombre,
-            whatsapp,
-            estado: 'confirmado',
-            fechaCompra: fechaISO,
-            montoPagadoCentavos: montoCentavos,
-            stripeCustomerId: session.customer || null
-          }, { merge: true });
-          console.log(`✅ comprasCurso/${session.id} creado`);
-
-          // 2) ACCESO al curso por uid (para lista de cursos comprados)
-          if (uid) {
-            await db.collection('accesosCurso').doc(uid).collection('cursos').doc(slug).set({
-              slug,
-              email,
-              nombre,
-              whatsapp,
-              activo: true,                         // ← formato que espera curso-acceso.html
-              estado: 'activo',                     // ← compatibilidad
-              fechaCompra: fechaISO,
-              stripeSessionId: session.id,
-              montoPagadoCentavos: montoCentavos
-            }, { merge: true });
-
-            // Datos del alumno bajo el uid
-            await db.collection('accesosCurso').doc(uid).set({
-              email,
-              nombre,
-              whatsapp,
-              ultimaActualizacion: fechaISO
-            }, { merge: true });
-            console.log(`✅ accesosCurso/${uid}/cursos/${slug} creado`);
-          }
-
-          // 3) INCREMENTAR cupo tomado del curso (para el contador de la landing)
-          try {
-            await db.collection('cursosVenta').doc(slug).update({
-              cupoLanzamientoTomados: admin.firestore.FieldValue.increment(1),
-              ultimoPago: fechaISO
-            });
-            console.log(`✅ cupo incrementado en cursosVenta/${slug}`);
-          } catch (e) {
-            console.warn(`⚠️ No se pudo incrementar cupo: ${e.message}`);
-          }
-
-          // 4) Registrar en pagos
-          const monto = montoCentavos
-            ? (montoCentavos / 100).toFixed(2) + ' ' + (session.currency || 'MXN').toUpperCase()
-            : '—';
-          await db.collection('pagos').add({
-            tipo: 'curso',
-            slug,
-            nombre, email, whatsapp,
-            monto,
-            stripeSessionId: session.id,
-            fecha: fechaISO,
-            estado: 'confirmado'
-          });
-
-          // 5) Certificado pendiente (para IPCIL)
-          await db.collection('certificadosPendientes').add({
-            slug,
-            uid: uid || null,
-            nombre,
-            email,
-            whatsapp,
-            fechaCompra: fechaISO,
-            estado: 'pendiente',
-            stripeSessionId: session.id
-          });
-
-          // 6) Correo de bienvenida (Resend) — datos del curso desde Firestore
-          try {
-            let nombreCurso = slug;
-            let ponente = '';
-            let colorMarca = null;
-            try {
-              const cursoDoc = await db.collection('cursosVenta').doc(slug).get();
-              if (cursoDoc.exists) {
-                const c = cursoDoc.data();
-                nombreCurso = c.nombre || c.titulo || slug;
-                ponente = c.instructorNombre || '';
-                colorMarca = c.colorMarca || null;
-              }
-            } catch (e) {
-              console.warn(`⚠️ No se pudo leer el curso para el correo: ${e.message}`);
-            }
-            await enviarCorreoCurso({ email, nombre, nombreCurso, ponente, sessionId: session.id, slug, colorMarca });
-          } catch (e) {
-            // El correo nunca debe tumbar el webhook: si falla, el acceso ya quedó guardado
-            console.error(`⚠️ Falló el envío de correo (acceso ya activado): ${e.message}`);
-          }
-
-          console.log(`✅ Curso activado: ${slug} para ${email}`);
+          await procesarCompraCurso(session);
           break;
         }
 
@@ -825,6 +884,23 @@ app.post('/stripe-webhook', async (req, res) => {
           });
 
           console.log(`✅ Miembro activado: ${email} | Plan: ${plan}`);
+        }
+        break;
+      }
+
+      // ─── Pagos diferidos (OXXO, etc.) de cursos ─────────────────────────────
+      case 'checkout.session.async_payment_succeeded': {
+        const session = event.data.object;
+        if (session.metadata?.tipo === 'curso') await procesarCompraCurso(session);
+        break;
+      }
+
+      case 'checkout.session.async_payment_failed': {
+        const session = event.data.object;
+        if (session.metadata?.tipo === 'curso') {
+          await db.collection('comprasCurso').doc(session.id).set({
+            estado: 'fallido', fallidoEn: new Date().toISOString()
+          }, { merge: true });
         }
         break;
       }
