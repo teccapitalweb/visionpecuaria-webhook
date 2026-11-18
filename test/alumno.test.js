@@ -381,3 +381,24 @@ test('bunny: firma del reproductor cuando hay llave (sha256 de llave+id+expira)'
   assert.ok(!urlBunny(b, '').includes('token='));
   assert.equal(bunnyDe({ bunny: { biblioteca: '555', id: 'x' } }), null);
 });
+
+test('calificación: alumno con acceso califica 1–5; promedio y la suya en el detalle; sin acceso → 403', async () => {
+  const mal = await api('/alumno/curso/embutidos-artesanales/calificacion', { token: 'tEmbutidos', method: 'POST', body: { estrellas: 7 } });
+  assert.equal(mal.status, 400);
+  const a = await api('/alumno/curso/embutidos-artesanales/calificacion', { token: 'tEmbutidos', method: 'POST', body: { estrellas: 5, comentario: 'Muy bueno <b>' } });
+  assert.equal(a.status, 200);
+  assert.deepEqual(a.data.calificaciones, { promedio: 5, total: 1, mia: { estrellas: 5, comentario: 'Muy bueno b' } });
+  const b = await api('/alumno/curso/embutidos-artesanales/calificacion', { token: 'tDos', method: 'POST', body: { estrellas: 4 } });
+  assert.equal(b.data.calificaciones.promedio, 4.5);
+  const otra = await api('/alumno/curso/embutidos-artesanales/calificacion', { token: 'tEmbutidos', method: 'POST', body: { estrellas: 3 } });
+  assert.equal(otra.data.calificaciones.total, 2);
+  assert.equal(otra.data.calificaciones.promedio, 3.5);
+  const det = await api('/alumno/curso/embutidos-artesanales', { token: 'tEmbutidos' });
+  assert.equal(det.data.calificaciones.mia.estrellas, 3);
+  assert.equal(det.data.calificaciones.promedio, 3.5);
+  const no = await api('/alumno/curso/embutidos-artesanales/calificacion', { token: 'tOtro', method: 'POST', body: { estrellas: 5 } });
+  assert.equal(no.status, 403);
+  const adm = await api('/admin/cursos/calificaciones', { token: 'tAdmin' });
+  assert.equal(adm.data.calificaciones.length, 2);
+  assert.equal((await api('/admin/cursos/calificaciones', { token: 'tEmbutidos' })).status, 403);
+});
