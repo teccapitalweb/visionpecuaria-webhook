@@ -182,7 +182,7 @@ function construirEmailCurso({ nombre, nombreCurso, ponente, sessionId, slug, co
   }
 
   // Aula permanente: el alumno entra con su correo verificado desde cualquier dispositivo
-  const linkAcceso = `${SITIO_URL}/aula/?curso=${encodeURIComponent(slug)}`;
+  const linkAcceso = `${SITIO_URL}/${encodeURIComponent(slug)}#mi-curso`;
   const primerNombre = (nombre || '').split(' ')[0] || 'alumno';
   const lineaPonente = ponente
     ? `<p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#4b5563;">Impartido por <b style="color:#1f2937;">${ponente}</b>.</p>`
@@ -222,7 +222,7 @@ function construirEmailCurso({ nombre, nombreCurso, ponente, sessionId, slug, co
           </table>
           <p style="margin:-8px 0 22px;font-size:13px;line-height:1.6;color:#6b7280;">
             Entra con <b>este mismo correo</b> (con Google o creando tu contraseña). Así podrás volver a tus clases
-            desde cualquier dispositivo, también con el botón <b>«Ya compré · Entrar a mi curso»</b> de la página del curso.
+            desde cualquier dispositivo, o con el botón <b>«Ya compré · Entrar a mi curso»</b> de la página del curso.
           </p>
 
           <!-- Nota certificado -->
