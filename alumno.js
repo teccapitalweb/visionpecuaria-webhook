@@ -47,6 +47,28 @@ function urlEmbebible(url) {
   return null;
 }
 
+const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Video de Bunny Stream guardado en la clase: { bunny: { biblioteca, id, cdn? } }
+function bunnyDe(c) {
+  const b = c && c.bunny;
+  if (!b || !GUID_RE.test(String(b.id || '')) || !/^\d{1,10}$/.test(String(b.biblioteca || ''))) return null;
+  const cdn = /^[a-z0-9-]+\.b-cdn\.net$/i.test(String(b.cdn || '')) ? String(b.cdn) : null;
+  return { biblioteca: String(b.biblioteca), id: String(b.id).toLowerCase(), cdn };
+}
+
+// URL del reproductor de Bunny; si hay llave de "Embed view token authentication", va firmada
+function urlBunny(b, llave, ahoraMs = Date.now(), ttlSeg = 4 * 3600) {
+  const base = `https://iframe.mediadelivery.net/embed/${b.biblioteca}/${b.id}`;
+  const q = ['autoplay=false', 'preload=true', 'responsive=true'];
+  if (llave) {
+    const expires = Math.floor(ahoraMs / 1000) + ttlSeg;
+    const token = crypto.createHash('sha256').update(llave + b.id + expires).digest('hex');
+    q.unshift(`token=${token}`, `expires=${expires}`);
+  }
+  return `${base}?${q.join('&')}`;
+}
+
 // Normaliza el arreglo de clases de cursosVenta (los tres esquemas que existen:
 // admin Drive → embedUrl/driveUrl, setup Gallinas → url, Storage → storagePath)
 function normalizarClases(clasesRaw) {
@@ -58,8 +80,9 @@ function normalizarClases(clasesRaw) {
     let id = String(c.id || c.claseId || `c${c.orden ?? i + 1}`);
     while (vistos.has(id)) id = id + '-' + (pos + 1);
     vistos.add(id);
-    const fuente = c.storagePath || c.embedUrl || c.url || c.driveUrl || null;
-    const did = driveId(c.driveUrl || c.embedUrl || c.url);
+    const bunny = bunnyDe(c);
+    const fuente = bunny || c.storagePath || c.embedUrl || c.url || c.driveUrl || null;
+    const did = bunny ? null : driveId(c.driveUrl || c.embedUrl || c.url);
     const pendiente = c.estado === 'pendiente' || c.publicada === false || !fuente;
     return {
       id,
@@ -69,7 +92,7 @@ function normalizarClases(clasesRaw) {
       descripcion: c.descripcion || '',
       duracionMin: Number(c.duracionMin) || null,
       fechaEnVivo: c.fechaEnVivo || null,
-      miniatura: c.posterPath || c.miniatura || (did ? `https://drive.google.com/thumbnail?id=${did}&sz=w960` : null),
+      miniatura: c.posterPath || c.miniatura || (bunny && bunny.cdn ? `https://${bunny.cdn}/${bunny.id}/thumbnail.jpg` : null) || (did ? `https://drive.google.com/thumbnail?id=${did}&sz=w960` : null),
       estado: pendiente ? 'pendiente' : 'publicada',
       materialesIds: Array.isArray(c.materialesIds) ? c.materialesIds.map(String) : [],
       _raw: c
@@ -139,7 +162,7 @@ function membresiaVigente(datos) {
   return datos.cancelado === true && fin && fin > new Date();
 }
 
-function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKET_DEFAULT, log = console }) {
+function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKET_DEFAULT, log = console, bunnyLlave = process.env.BUNNY_TOKEN_AUTH_KEY || process.env.BUNNY_TOKEN_KEY || '' }) {
 
   async function tokenRequerido(req, res) {
     const h = req.get('authorization') || '';
@@ -337,6 +360,14 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
       const materiales = normalizarMateriales(curso.recursosDescargables);
       const prog = await leerProgreso(u.uid, slug);
       const certificado = await estadoCertificado(u, slug);
+      let solicitudCertificado = null;
+      try {
+        const sol = await db.collection('solicitudesCertificado').doc(`${u.uid}_${slug}`).get();
+        if (sol.exists) {
+          const sd = sol.data() || {};
+          solicitudCertificado = { estado: sd.estado || 'pendiente', fechaSolicitud: sd.fechaSolicitud || null, nombreCompleto: sd.nombreCompleto || '', whatsapp: sd.whatsapp || '', estadoRep: sd.estadoRep || '', ciudad: sd.ciudad || '' };
+        }
+      } catch (e) { log.warn('solicitudCertificado:', e.message); }
 
       res.setHeader('Cache-Control', 'private, no-store');
       res.json({
@@ -359,7 +390,8 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
           clases: (prog && prog.clases) || {},
           ...resumenProgreso(prog, clases)
         },
-        certificado
+        certificado,
+        solicitudCertificado
       });
     } catch (err) {
       log.error('❌ /alumno/curso:', err);
@@ -377,6 +409,11 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
       if (!clase) return res.status(404).json({ error: 'Clase no encontrada' });
       if (clase.estado !== 'publicada') return res.status(409).json({ error: 'Esta grabación aún no está publicada' });
       const r = clase._raw;
+      const bunny = bunnyDe(r);
+      if (bunny) {
+        res.setHeader('Cache-Control', 'private, no-store');
+        return res.json({ tipo: 'iframe', proveedor: 'bunny', url: urlBunny(bunny, bunnyLlave) });
+      }
       if (r.storagePath) return res.json({ tipo: 'video', url: await urlFirmada(r.storagePath) });
       const embed = urlEmbebible(r.embedUrl || r.url || r.driveUrl);
       if (!embed) return res.status(409).json({ error: 'La fuente del video no es válida' });
@@ -433,6 +470,147 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
     } catch (err) {
       log.error('❌ /alumno/progreso:', err);
       res.status(500).json({ error: 'No pudimos guardar tu progreso' });
+    }
+  });
+
+  // ─── ALUMNO: solicitar certificado ─────────────────────────────────────────
+  const limpio = (v, n) => String(v == null ? '' : v).replace(/[\u0000-\u001f<>]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, n);
+
+  app.post('/alumno/curso/:slug/certificado/solicitar', async (req, res) => {
+    try {
+      const u = await tokenRequerido(req, res); if (!u) return;
+      const slug = String(req.params.slug || '').slice(0, 120);
+      const acceso = await accesoA(u, slug);
+      if (!acceso) return res.status(403).json({ error: 'Sin acceso a este curso' });
+      const nombreCompleto = limpio(req.body?.nombreCompleto, 120);
+      const whatsapp = limpio(req.body?.whatsapp, 20).replace(/[^\d+]/g, '');
+      const estadoRep = limpio(req.body?.estado, 60);
+      const ciudad = limpio(req.body?.ciudad, 80);
+      const ocupacion = limpio(req.body?.ocupacion, 80);
+      const comentarios = limpio(req.body?.comentarios, 400);
+      if (nombreCompleto.split(' ').filter(Boolean).length < 2) return res.status(400).json({ error: 'Escribe tu nombre completo como quieres que aparezca en el certificado' });
+      if (whatsapp.replace(/\D/g, '').length < 10) return res.status(400).json({ error: 'Escribe un número de WhatsApp válido (10 dígitos)' });
+      if (!estadoRep) return res.status(400).json({ error: 'Indica tu estado' });
+
+      const cert = await estadoCertificado(u, slug);
+      if (cert.estado === 'emitido') return res.status(409).json({ error: 'Tu certificado ya fue emitido', certificado: cert });
+
+      const curso = await leerCurso(slug);
+      const clases = normalizarClases(curso && curso.clases);
+      const prog = await leerProgreso(u.uid, slug);
+      const resumen = resumenProgreso(prog, clases);
+      const ref = db.collection('solicitudesCertificado').doc(`${u.uid}_${slug}`);
+      const prev = await ref.get();
+      if (prev.exists && prev.data()?.estado === 'emitido') return res.status(409).json({ error: 'Tu certificado ya fue emitido' });
+      const ahora = new Date().toISOString();
+      const datos = {
+        uid: u.uid,
+        email: (u.email || '').toLowerCase(),
+        emailVerificado: u.email_verified === true,
+        slug,
+        cursoNombre: (curso && (curso.nombre || curso.titulo)) || slug,
+        nombreCompleto, whatsapp, estadoRep, ciudad, ocupacion, comentarios,
+        progresoPorcentaje: resumen.porcentaje,
+        clasesCompletadas: resumen.completadas,
+        clasesTotales: resumen.total,
+        fechaCompra: acceso.fechaCompra || null,
+        estado: 'pendiente',
+        actualizadoEn: ahora
+      };
+      if (!prev.exists) datos.fechaSolicitud = ahora;
+      await ref.set(datos, { merge: true });
+      res.json({ ok: true, solicitud: { estado: 'pendiente', fechaSolicitud: prev.exists ? (prev.data().fechaSolicitud || ahora) : ahora, nombreCompleto, whatsapp, estadoRep, ciudad } });
+    } catch (err) {
+      log.error('❌ /alumno/certificado/solicitar:', err);
+      res.status(500).json({ error: 'No pudimos registrar tu solicitud' });
+    }
+  });
+
+  // ─── ADMIN: solicitudes de certificado ─────────────────────────────────────
+  app.get('/admin/certificados/solicitudes', async (req, res) => {
+    try {
+      const a = await adminRequerido(req, res); if (!a) return;
+      const snap = await db.collection('solicitudesCertificado').get();
+      const lista = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+        .sort((x, y) => String(y.fechaSolicitud || '').localeCompare(String(x.fechaSolicitud || '')));
+      res.setHeader('Cache-Control', 'private, no-store');
+      res.json({ solicitudes: lista.slice(0, 1000) });
+    } catch (err) {
+      log.error('❌ /admin/certificados/solicitudes:', err);
+      res.status(500).json({ error: 'No pudimos cargar las solicitudes' });
+    }
+  });
+
+  app.post('/admin/certificados/solicitudes/estado', async (req, res) => {
+    try {
+      const a = await adminRequerido(req, res); if (!a) return;
+      const id = String(req.body?.id || '').slice(0, 200);
+      const estado = String(req.body?.estado || '');
+      if (!['pendiente', 'en_proceso', 'emitido', 'rechazado'].includes(estado)) return res.status(400).json({ error: 'Estado inválido' });
+      const ref = db.collection('solicitudesCertificado').doc(id);
+      const snap = await ref.get();
+      if (!snap.exists) return res.status(404).json({ error: 'Solicitud no encontrada' });
+      const cambio = { estado, actualizadoEn: new Date().toISOString(), atendidoPor: a.email || a.uid };
+      if (req.body?.folio !== undefined) cambio.folio = limpio(req.body.folio, 60);
+      if (req.body?.nota !== undefined) cambio.notaAdmin = limpio(req.body.nota, 400);
+      await ref.set(cambio, { merge: true });
+      await auditar(a, 'solicitud-certificado', { solicitudId: id, slug: snap.data().slug || null, estado, folio: cambio.folio || null });
+      res.json({ ok: true });
+    } catch (err) {
+      log.error('❌ /admin/certificados/solicitudes/estado:', err);
+      res.status(500).json({ error: 'No pudimos actualizar la solicitud' });
+    }
+  });
+
+  // ─── ADMIN: contenido de Bunny por curso ───────────────────────────────────
+  // Escribe cursosContenidoPrivado/{slug}: copia las clases públicas (mismos id, títulos y orden,
+  // así el progreso de los alumnos se conserva) y les pone su video de Bunny; ya no lleva enlaces de Drive.
+  app.post('/admin/cursos/contenido-bunny', async (req, res) => {
+    try {
+      const a = await adminRequerido(req, res); if (!a) return;
+      const slug = String(req.body?.slug || '').slice(0, 120);
+      const biblioteca = String(req.body?.biblioteca || '');
+      const cdn = String(req.body?.cdn || '');
+      const videos = Array.isArray(req.body?.videos) ? req.body.videos : [];
+      if (!/^\d{1,10}$/.test(biblioteca)) return res.status(400).json({ error: 'Biblioteca de Bunny inválida' });
+      const pub = await db.collection('cursosVenta').doc(slug).get();
+      if (!pub.exists) return res.status(404).json({ error: 'Curso no encontrado' });
+      const base = normalizarClases((pub.data() || {}).clases);
+      if (!base.length) return res.status(409).json({ error: 'El curso no tiene clases' });
+      const porOrden = new Map();
+      for (const v of videos) {
+        const n = Number(v && v.orden);
+        if (!Number.isInteger(n) || n < 1 || n > base.length) return res.status(400).json({ error: 'Orden fuera de rango: ' + (v && v.orden) });
+        if (!GUID_RE.test(String(v.id || ''))) return res.status(400).json({ error: 'ID de video de Bunny inválido en la clase ' + n });
+        porOrden.set(n, v);
+      }
+      const clases = base.map((c, i) => {
+        const raw = { ...c._raw };
+        delete raw.url; delete raw.embedUrl; delete raw.driveUrl; delete raw.storagePath;
+        const v = porOrden.get(i + 1);
+        const out = { ...raw, id: c.id, orden: c.orden, titulo: c.titulo };
+        if (v) {
+          out.bunny = { biblioteca, id: String(v.id).toLowerCase(), ...(cdn ? { cdn } : {}) };
+          if (Number(v.duracionSeg) > 0) out.duracionMin = Math.max(1, Math.round(Number(v.duracionSeg) / 60));
+          if (out.estado === 'pendiente') delete out.estado;
+          if (out.publicada === false) delete out.publicada;
+        } else {
+          delete out.bunny;
+          out.estado = 'pendiente';
+        }
+        return out;
+      });
+      const privRef = db.collection('cursosContenidoPrivado').doc(slug);
+      const prevPriv = await privRef.get();
+      const recursos = prevPriv.exists && Array.isArray(prevPriv.data().recursosDescargables)
+        ? prevPriv.data().recursosDescargables
+        : ((pub.data() || {}).recursosDescargables || []);
+      await privRef.set({ clases, recursosDescargables: recursos, proveedorVideo: 'bunny', bibliotecaBunny: biblioteca, actualizadoEn: new Date().toISOString() }, { merge: true });
+      await auditar(a, 'contenido-bunny', { slug, biblioteca, clasesConVideo: porOrden.size, totalClases: clases.length });
+      res.json({ ok: true, clases: clases.map(c => ({ orden: c.orden, titulo: c.titulo, bunny: !!c.bunny })) });
+    } catch (err) {
+      log.error('❌ /admin/cursos/contenido-bunny:', err);
+      res.status(500).json({ error: 'No pudimos guardar el contenido' });
     }
   });
 
@@ -569,5 +747,5 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
 
 module.exports = {
   registrarRutasAlumno,
-  _internos: { uidSintetico, driveId, urlEmbebible, normalizarClases, normalizarMateriales, fusionarProgreso, resumenProgreso }
+  _internos: { uidSintetico, driveId, urlEmbebible, normalizarClases, normalizarMateriales, fusionarProgreso, resumenProgreso, bunnyDe, urlBunny }
 };
