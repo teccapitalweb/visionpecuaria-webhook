@@ -369,8 +369,21 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
         }
       } catch (e) { log.warn('solicitudCertificado:', e.message); }
 
+      let calificaciones = { promedio: 0, total: 0, mia: null };
+      try {
+        const cs = await db.collection('calificacionesCurso').where('slug', '==', slug).get();
+        const todas = cs.docs.map(d => d.data() || {}).filter(c => Number(c.estrellas) >= 1 && Number(c.estrellas) <= 5);
+        const mia = todas.find(c => c.uid === u.uid) || null;
+        calificaciones = {
+          promedio: todas.length ? Math.round(todas.reduce((a, c) => a + Number(c.estrellas), 0) / todas.length * 10) / 10 : 0,
+          total: todas.length,
+          mia: mia ? { estrellas: Number(mia.estrellas), comentario: mia.comentario || '' } : null
+        };
+      } catch (e) { log.warn('calificaciones:', e.message); }
+
       res.setHeader('Cache-Control', 'private, no-store');
       res.json({
+        calificaciones,
         curso: {
           slug,
           nombre: curso.nombre || curso.titulo || slug,
@@ -523,6 +536,51 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
     } catch (err) {
       log.error('❌ /alumno/certificado/solicitar:', err);
       res.status(500).json({ error: 'No pudimos registrar tu solicitud' });
+    }
+  });
+
+  // ─── ALUMNO: calificar el curso ────────────────────────────────────────────
+  app.post('/alumno/curso/:slug/calificacion', async (req, res) => {
+    try {
+      const u = await tokenRequerido(req, res); if (!u) return;
+      const slug = String(req.params.slug || '').slice(0, 120);
+      if (!(await accesoA(u, slug))) return res.status(403).json({ error: 'Sin acceso a este curso' });
+      const estrellas = Number(req.body?.estrellas);
+      if (!Number.isInteger(estrellas) || estrellas < 1 || estrellas > 5) return res.status(400).json({ error: 'Elige de 1 a 5 estrellas' });
+      const comentario = limpio(req.body?.comentario, 1000);
+      const ref = db.collection('calificacionesCurso').doc(`${slug}_${u.uid}`);
+      const prev = await ref.get();
+      const ahora = new Date().toISOString();
+      await ref.set({
+        uid: u.uid, slug, estrellas, comentario,
+        email: (u.email || '').toLowerCase(),
+        actualizadoEn: ahora,
+        ...(prev.exists ? {} : { creadoEn: ahora })
+      }, { merge: true });
+      const cs = await db.collection('calificacionesCurso').where('slug', '==', slug).get();
+      const todas = cs.docs.map(d => d.data() || {}).filter(c => Number(c.estrellas) >= 1);
+      res.json({ ok: true, calificaciones: {
+        promedio: Math.round(todas.reduce((a, c) => a + Number(c.estrellas), 0) / todas.length * 10) / 10,
+        total: todas.length,
+        mia: { estrellas, comentario }
+      } });
+    } catch (err) {
+      log.error('❌ /alumno/calificacion:', err);
+      res.status(500).json({ error: 'No pudimos guardar tu calificación' });
+    }
+  });
+
+  app.get('/admin/cursos/calificaciones', async (req, res) => {
+    try {
+      const a = await adminRequerido(req, res); if (!a) return;
+      const cs = await db.collection('calificacionesCurso').get();
+      const lista = cs.docs.map(d => ({ id: d.id, ...d.data() }))
+        .sort((x, y) => String(y.actualizadoEn || '').localeCompare(String(x.actualizadoEn || '')));
+      res.setHeader('Cache-Control', 'private, no-store');
+      res.json({ calificaciones: lista.slice(0, 2000) });
+    } catch (err) {
+      log.error('❌ /admin/cursos/calificaciones:', err);
+      res.status(500).json({ error: 'No pudimos cargar las calificaciones' });
     }
   });
 
