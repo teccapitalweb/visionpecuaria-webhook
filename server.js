@@ -409,9 +409,9 @@ app.post('/crear-checkout-curso', async (req, res) => {
     const nombre = sanearTexto(nombreRaw);
     const whatsapp = sanearTexto(whatsappRaw).replace(/\D/g, '');
 
-    if (!slug)   return res.status(400).json({ error: 'Slug del curso requerido' });
-    if (!email)  return res.status(400).json({ error: 'Email requerido' });
-    if (!nombre) return res.status(400).json({ error: 'Nombre requerido' });
+    if (!slug) return res.status(400).json({ error: 'Slug del curso requerido' });
+    // email/nombre/whatsapp son opcionales: el checkout directo deja que Stripe
+    // recoja correo, nombre y teléfono en su propio formulario (como Sinergia).
 
     // 1) Leer el curso de Firestore
     const cursoSnap = await db.collection('cursosVenta').doc(slug).get();
@@ -452,7 +452,8 @@ app.post('/crear-checkout-curso', async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       ui_mode: 'embedded',
-      customer_email: email,
+      ...(email ? { customer_email: email } : {}),
+      phone_number_collection: { enabled: true },
       line_items: [{
         price_data: {
           currency: curso.moneda || 'mxn',
@@ -635,8 +636,8 @@ async function procesarCompraCurso(session) {
         slug: session.metadata?.slug || null,
         uid: session.metadata?.uid || null,
         email: (session.customer_email || session.customer_details?.email || '').toLowerCase().trim(),
-        nombre: session.metadata?.nombre || '',
-        whatsapp: session.metadata?.whatsapp || '',
+        nombre: session.metadata?.nombre || session.customer_details?.name || '',
+        whatsapp: session.metadata?.whatsapp || session.customer_details?.phone || '',
         estado: 'pendiente',
         estadoPagoStripe: session.payment_status || null,
         fechaCompra: new Date().toISOString(),
@@ -661,9 +662,13 @@ async function procesarCompraCurso(session) {
   try {
       const email = (session.customer_email || session.customer_details?.email || '').toLowerCase().trim();
       const slug = session.metadata?.slug;
-      const nombre = session.metadata?.nombre || email.split('@')[0];
+      const nombre = session.metadata?.nombre || session.customer_details?.name || email.split('@')[0];
       const whatsapp = session.metadata?.whatsapp || session.customer_details?.phone || '';
       let uid = session.metadata?.uid;
+      if (!uid && email) {
+        // Checkout directo (sin formulario previo): mismo uid sintético que usa el aula
+        uid = require('./alumno')._internos.uidSintetico(email);
+      }
 
       if (!email || !slug) {
         console.warn('⚠️ Curso: faltan email o slug en metadata');
