@@ -103,11 +103,14 @@ function normalizarClases(clasesRaw) {
 function normalizarMateriales(recursosRaw) {
   return (Array.isArray(recursosRaw) ? recursosRaw : []).map((r, i) => {
     r = r || {};
-    const tipo = String(r.tipo || '').toLowerCase() || (/\.xlsx?($|\?)/i.test(r.url || '') ? 'xlsx' : 'pdf');
+    const ruta = String(r.url || r.storagePath || '');
+    const ext = (ruta.match(/\.(pdf|pptx?|docx?|xlsx?|zip)($|\?)/i) || [])[1];
+    const tipo = String(r.tipo || '').toLowerCase() || (ext ? ext.toLowerCase().replace(/^(ppt|doc|xls)$/, '$1x') : 'pdf');
     return {
       id: String(r.id || `m${i + 1}`),
       titulo: r.titulo || 'Material',
       descripcion: r.descripcion || '',
+      categoria: r.categoria || '',
       tipo,
       claseId: r.claseId ? String(r.claseId) : null,
       disponible: !!(r.storagePath || r.url || r.driveUrl),
@@ -723,14 +726,17 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
         const titulo = String(r && r.titulo || '').trim().slice(0, 160);
         const storagePath = String(r && r.storagePath || '').trim();
         const url = String(r && r.url || '').trim();
+        const extra = {};
+        const desc = String(r && r.descripcion || '').trim().slice(0, 280); if (desc) extra.descripcion = desc;
+        const cat = String(r && r.categoria || '').trim().slice(0, 40); if (cat) extra.categoria = cat;
         if (!titulo) throw Object.assign(new Error('Título vacío en el recurso ' + (i + 1)), { http: 400 });
         if (url) {
           // Bunny Storage servido por su Pull Zone (*.b-cdn.net)
           if (!/^https:\/\/[a-z0-9-]+\.b-cdn\.net\/[\w\-./%() ]+$/i.test(url)) throw Object.assign(new Error('URL de Bunny inválida en el recurso ' + (i + 1)), { http: 400 });
-          return { id: 'mat-' + (i + 1), titulo, url };
+          return { id: 'mat-' + (i + 1), titulo, url, ...extra };
         }
         if (!/^cursos\/[\w-]+\/materiales\/[\w .()\-]+$/.test(storagePath)) throw Object.assign(new Error('storagePath inválido en el recurso ' + (i + 1)), { http: 400 });
-        return { id: 'mat-' + (i + 1), titulo, storagePath };
+        return { id: 'mat-' + (i + 1), titulo, storagePath, ...extra };
       });
       await db.collection('cursosContenidoPrivado').doc(slug).set({ recursosDescargables: recursos, actualizadoEn: new Date().toISOString() }, { merge: true });
       await auditar(a, 'materiales', { slug, total: recursos.length });
