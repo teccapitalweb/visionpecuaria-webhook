@@ -702,6 +702,16 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
     }
   });
 
+  app.get('/admin/cursos/buckets', async (req, res) => {
+    try {
+      const a = await adminRequerido(req, res); if (!a) return;
+      const [buckets] = await admin.storage().bucket(bucketName).storage.getBuckets();
+      res.json({ ok: true, proyecto: (buckets[0] || {}).metadata?.projectNumber || null, buckets: buckets.map(b => b.name) });
+    } catch (err) {
+      res.status(500).json({ error: String(err.message || err).slice(0, 200) });
+    }
+  });
+
   app.post('/admin/cursos/materiales', async (req, res) => {
     try {
       const a = await adminRequerido(req, res); if (!a) return;
