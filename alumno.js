@@ -673,8 +673,7 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
   });
 
   // ─── ADMIN: materiales del curso (archivo a Storage + lista) ───────────────
-  const materialJson = require('express').json({ limit: '3mb' });
-  app.post('/admin/cursos/material-archivo', materialJson, async (req, res) => {
+  app.post('/admin/cursos/material-archivo', async (req, res) => {
     try {
       const a = await adminRequerido(req, res); if (!a) return;
       const slug = String(req.body?.slug || '').slice(0, 120);

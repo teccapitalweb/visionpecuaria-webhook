@@ -59,7 +59,8 @@ app.use((req, res, next) => {
 
 // ─── Raw body para Stripe (DEBE ir antes de express.json) ────────────────────
 app.use('/stripe-webhook', express.raw({ type: 'application/json' }));
-app.use(express.json());
+// 3 MB: /admin/cursos/material-archivo recibe archivos en base64 (límite propio de 2 MB)
+app.use(express.json({ limit: '3mb' }));
 
 // ─── Helper: buscar miembro por email ────────────────────────────────────────
 async function buscarMiembroPorEmail(email) {
