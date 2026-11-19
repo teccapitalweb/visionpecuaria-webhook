@@ -722,7 +722,13 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
       const recursos = lista.map((r, i) => {
         const titulo = String(r && r.titulo || '').trim().slice(0, 160);
         const storagePath = String(r && r.storagePath || '').trim();
+        const url = String(r && r.url || '').trim();
         if (!titulo) throw Object.assign(new Error('Título vacío en el recurso ' + (i + 1)), { http: 400 });
+        if (url) {
+          // Bunny Storage servido por su Pull Zone (*.b-cdn.net)
+          if (!/^https:\/\/[a-z0-9-]+\.b-cdn\.net\/[\w\-./%() ]+$/i.test(url)) throw Object.assign(new Error('URL de Bunny inválida en el recurso ' + (i + 1)), { http: 400 });
+          return { id: 'mat-' + (i + 1), titulo, url };
+        }
         if (!/^cursos\/[\w-]+\/materiales\/[\w .()\-]+$/.test(storagePath)) throw Object.assign(new Error('storagePath inválido en el recurso ' + (i + 1)), { http: 400 });
         return { id: 'mat-' + (i + 1), titulo, storagePath };
       });

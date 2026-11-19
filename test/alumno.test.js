@@ -434,3 +434,16 @@ test('materiales admin: validaciones y 403 sin claim', async () => {
   r = await api('/admin/cursos/materiales', { token: 'tAdmin', method: 'POST', body: { slug: 'no-existe', recursos: [] } });
   assert.equal(r.status, 404);
 });
+
+test('materiales con URL de Bunny: el listado no la expone y /material la entrega al alumno', async () => {
+  const url = 'https://visionpecuariamateriales.b-cdn.net/gallinas/Modulo_01_Fundamentos.pptx';
+  let r = await api('/admin/cursos/materiales', { token: 'tAdmin', method: 'POST', body: { slug: 'gallinas-de-postura', recursos: [{ titulo: 'Módulo 01', url }] } });
+  assert.equal(r.status, 200);
+  const det = await api('/alumno/curso/gallinas-de-postura', { token: 'tGallinas' });
+  assert.ok(!JSON.stringify(det.data.materiales).includes('b-cdn.net'));
+  assert.equal(det.data.materiales[0].disponible, true);
+  const mat = await api('/alumno/curso/gallinas-de-postura/material', { token: 'tGallinas', method: 'POST', body: { materialId: det.data.materiales[0].id } });
+  assert.equal(mat.data.url, url);
+  r = await api('/admin/cursos/materiales', { token: 'tAdmin', method: 'POST', body: { slug: 'gallinas-de-postura', recursos: [{ titulo: 'X', url: 'https://evil.com/a.pptx' }] } });
+  assert.equal(r.status, 400);
+});
