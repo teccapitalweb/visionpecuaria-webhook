@@ -447,3 +447,15 @@ test('materiales con URL de Bunny: el listado no la expone y /material la entreg
   r = await api('/admin/cursos/materiales', { token: 'tAdmin', method: 'POST', body: { slug: 'gallinas-de-postura', recursos: [{ titulo: 'X', url: 'https://evil.com/a.pptx' }] } });
   assert.equal(r.status, 400);
 });
+
+test('materiales: descripción, categoría y tipo pptx llegan al alumno', async () => {
+  const url = 'https://visionpecuariamateriales.b-cdn.net/Modulo_02_Nutricion.pptx';
+  const r = await api('/admin/cursos/materiales', { token: 'tAdmin', method: 'POST', body: { slug: 'gallinas-de-postura', recursos: [{ titulo: 'Módulo 02', url, descripcion: 'Requerimientos por etapa', categoria: 'Nutrición' }] } });
+  assert.equal(r.status, 200);
+  const det = await api('/alumno/curso/gallinas-de-postura', { token: 'tGallinas' });
+  const m = det.data.materiales[0];
+  assert.equal(m.descripcion, 'Requerimientos por etapa');
+  assert.equal(m.categoria, 'Nutrición');
+  assert.equal(m.tipo, 'pptx');
+  assert.ok(!JSON.stringify(det.data.materiales).includes('b-cdn.net'));
+});
