@@ -686,12 +686,19 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
       const buf = Buffer.from(b64, 'base64');
       if (!buf.length) return res.status(400).json({ error: 'Archivo vacío' });
       const storagePath = `cursos/${slug}/materiales/${nombre.replace(/\s+/g, '_')}`;
-      await admin.storage().bucket(bucketName).file(storagePath).save(buf, { contentType, resumable: false });
+      try {
+        await admin.storage().bucket(bucketName).file(storagePath).save(buf, { contentType, resumable: false });
+      } catch (e1) {
+        // Algunos proyectos usan el bucket clásico .appspot.com
+        const alterno = bucketName.replace(/\.firebasestorage\.app$/, '.appspot.com');
+        if (alterno === bucketName) throw e1;
+        await admin.storage().bucket(alterno).file(storagePath).save(buf, { contentType, resumable: false });
+      }
       await auditar(a, 'material-archivo', { slug, storagePath, bytes: buf.length });
       res.json({ ok: true, storagePath, bytes: buf.length });
     } catch (err) {
       log.error('❌ /admin/cursos/material-archivo:', err);
-      res.status(500).json({ error: 'No pudimos guardar el archivo' });
+      res.status(500).json({ error: 'No pudimos guardar el archivo', detalle: String(err.message || err).slice(0, 200) });
     }
   });
 
