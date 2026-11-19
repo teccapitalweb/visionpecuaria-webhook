@@ -105,7 +105,7 @@ function fakeStripe(sessions = {}) {
 }
 
 const fakeAdmin = (db) => ({
-  storage: () => ({ bucket: () => ({ file: (p) => ({ getSignedUrl: async () => [`https://signed.example/${p}?sig=1`] }) }) }),
+  storage: () => ({ bucket: () => ({ file: (p) => ({ getSignedUrl: async () => [`https://signed.example/${p}?sig=1`], save: async (buf, opts) => { (fakeAdmin._guardados = fakeAdmin._guardados || []).push({ path: p, bytes: buf.length, contentType: opts && opts.contentType }); } }) }) }),
   firestore: Object.assign(() => db, { FieldValue: { increment: (n) => ({ __increment: n }) }, Timestamp: { fromMillis: (ms) => ({ seconds: ms / 1000 }) } })
 });
 

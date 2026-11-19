@@ -402,3 +402,35 @@ test('calificación: alumno con acceso califica 1–5; promedio y la suya en el 
   assert.equal(adm.data.calificaciones.length, 2);
   assert.equal((await api('/admin/cursos/calificaciones', { token: 'tEmbutidos' })).status, 403);
 });
+
+test('admin sube un material y publica la lista; el alumno lo ve y lo descarga firmado', async () => {
+  const b64 = Buffer.from('PK\u0003\u0004contenido-pptx').toString('base64');
+  let r = await api('/admin/cursos/material-archivo', { token: 'tAdmin', method: 'POST', body: { slug: 'gallinas-de-postura', nombre: 'Modulo 01 Fundamentos.pptx', contentType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', base64: b64 } });
+  assert.equal(r.status, 200);
+  assert.equal(r.data.storagePath, 'cursos/gallinas-de-postura/materiales/Modulo_01_Fundamentos.pptx');
+  assert.ok((fakeAdmin._guardados || []).some(g => g.path === r.data.storagePath && g.bytes > 0));
+
+  r = await api('/admin/cursos/materiales', { token: 'tAdmin', method: 'POST', body: { slug: 'gallinas-de-postura', recursos: [{ titulo: 'Módulo 01 · Fundamentos', storagePath: r.data.storagePath }] } });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.data.recursos, [{ id: 'mat-1', titulo: 'Módulo 01 · Fundamentos' }]);
+
+  const det = await api('/alumno/curso/gallinas-de-postura', { token: 'tGallinas' });
+  assert.equal(det.status, 200);
+  assert.deepEqual(det.data.materiales.map(m => [m.titulo, m.disponible]), [['Módulo 01 · Fundamentos', true]]);
+  assert.ok(!JSON.stringify(det.data.materiales).includes('storagePath'));
+
+  const mat = await api('/alumno/curso/gallinas-de-postura/material', { token: 'tGallinas', method: 'POST', body: { materialId: det.data.materiales[0].id } });
+  assert.equal(mat.status, 200);
+  assert.match(mat.data.url, /^https:\/\/signed\.example\/cursos\/gallinas-de-postura\/materiales\//);
+});
+
+test('materiales admin: validaciones y 403 sin claim', async () => {
+  let r = await api('/admin/cursos/material-archivo', { token: 'tGallinas', method: 'POST', body: { slug: 'gallinas-de-postura', nombre: 'x.pptx', base64: 'aaaa' } });
+  assert.equal(r.status, 403);
+  r = await api('/admin/cursos/material-archivo', { token: 'tAdmin', method: 'POST', body: { slug: 'gallinas-de-postura', nombre: '../../etc/passwd', base64: 'aaaa' } });
+  assert.equal(r.status, 400);
+  r = await api('/admin/cursos/materiales', { token: 'tAdmin', method: 'POST', body: { slug: 'gallinas-de-postura', recursos: [{ titulo: 'X', storagePath: 'otro/lado.pptx' }] } });
+  assert.equal(r.status, 400);
+  r = await api('/admin/cursos/materiales', { token: 'tAdmin', method: 'POST', body: { slug: 'no-existe', recursos: [] } });
+  assert.equal(r.status, 404);
+});

@@ -672,6 +672,54 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
     }
   });
 
+  // ─── ADMIN: materiales del curso (archivo a Storage + lista) ───────────────
+  const materialJson = require('express').json({ limit: '3mb' });
+  app.post('/admin/cursos/material-archivo', materialJson, async (req, res) => {
+    try {
+      const a = await adminRequerido(req, res); if (!a) return;
+      const slug = String(req.body?.slug || '').slice(0, 120);
+      const nombre = String(req.body?.nombre || '').trim();
+      const contentType = String(req.body?.contentType || 'application/octet-stream').slice(0, 100);
+      const b64 = String(req.body?.base64 || '');
+      if (!slug || !(await db.collection('cursosVenta').doc(slug).get()).exists) return res.status(404).json({ error: 'Curso no encontrado' });
+      if (!/^[\w .()\-]{1,120}\.(pdf|pptx?|docx?|xlsx?|zip)$/i.test(nombre)) return res.status(400).json({ error: 'Nombre de archivo inválido' });
+      if (!b64 || b64.length > 2.8e6) return res.status(400).json({ error: 'Archivo vacío o mayor a 2 MB' });
+      const buf = Buffer.from(b64, 'base64');
+      if (!buf.length) return res.status(400).json({ error: 'Archivo vacío' });
+      const storagePath = `cursos/${slug}/materiales/${nombre.replace(/\s+/g, '_')}`;
+      await admin.storage().bucket(bucketName).file(storagePath).save(buf, { contentType, resumable: false });
+      await auditar(a, 'material-archivo', { slug, storagePath, bytes: buf.length });
+      res.json({ ok: true, storagePath, bytes: buf.length });
+    } catch (err) {
+      log.error('❌ /admin/cursos/material-archivo:', err);
+      res.status(500).json({ error: 'No pudimos guardar el archivo' });
+    }
+  });
+
+  app.post('/admin/cursos/materiales', async (req, res) => {
+    try {
+      const a = await adminRequerido(req, res); if (!a) return;
+      const slug = String(req.body?.slug || '').slice(0, 120);
+      const lista = Array.isArray(req.body?.recursos) ? req.body.recursos : null;
+      if (!slug || !(await db.collection('cursosVenta').doc(slug).get()).exists) return res.status(404).json({ error: 'Curso no encontrado' });
+      if (!lista) return res.status(400).json({ error: 'Falta la lista de recursos' });
+      const recursos = lista.map((r, i) => {
+        const titulo = String(r && r.titulo || '').trim().slice(0, 160);
+        const storagePath = String(r && r.storagePath || '').trim();
+        if (!titulo) throw Object.assign(new Error('Título vacío en el recurso ' + (i + 1)), { http: 400 });
+        if (!/^cursos\/[\w-]+\/materiales\/[\w .()\-]+$/.test(storagePath)) throw Object.assign(new Error('storagePath inválido en el recurso ' + (i + 1)), { http: 400 });
+        return { id: 'mat-' + (i + 1), titulo, storagePath };
+      });
+      await db.collection('cursosContenidoPrivado').doc(slug).set({ recursosDescargables: recursos, actualizadoEn: new Date().toISOString() }, { merge: true });
+      await auditar(a, 'materiales', { slug, total: recursos.length });
+      res.json({ ok: true, recursos: recursos.map(r => ({ id: r.id, titulo: r.titulo })) });
+    } catch (err) {
+      if (err.http === 400) return res.status(400).json({ error: err.message });
+      log.error('❌ /admin/cursos/materiales:', err);
+      res.status(500).json({ error: 'No pudimos guardar los materiales' });
+    }
+  });
+
   // ─── ADMIN: conciliación de compras históricas ─────────────────────────────
   app.get('/admin/cursos/buscar', async (req, res) => {
     try {
