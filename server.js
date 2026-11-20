@@ -22,6 +22,11 @@ const PRICE_ANUAL   = process.env.STRIPE_PRICE_ANUAL   || 'price_1TPbCQPBgqsOPfU
 
 // URL pública del sitio (para return_url de Stripe)
 const SITIO_URL = process.env.SITIO_URL || 'https://visionpecuariamx.com';
+// Cursos cuya aula vive dentro de su landing (se vuelve ahí tras pagar)
+const AULA_EN_LANDING = {
+  'gallinas-de-postura': '/gallinas-de-postura.html',
+  'embutidos-artesanales': '/embutidos-artesanales.html'
+};
 
 // ─── Resend (envío de correos) ───────────────────────────────────────────────
 // La API key vive en Railway como RESEND_API_KEY.
@@ -475,7 +480,10 @@ app.post('/crear-checkout-curso', async (req, res) => {
         whatsapp,
         email
       },
-      return_url: `${SITIO_URL}/curso-acceso.html?slug=${encodeURIComponent(slug)}&session_id={CHECKOUT_SESSION_ID}`
+      // Gallinas y Embutidos tienen el aula dentro de su propia landing: al pagar se vuelve ahí y se entra directo.
+      return_url: AULA_EN_LANDING[slug]
+        ? `${SITIO_URL}${AULA_EN_LANDING[slug]}?pago=ok&session_id={CHECKOUT_SESSION_ID}`
+        : `${SITIO_URL}/curso-acceso.html?slug=${encodeURIComponent(slug)}&session_id={CHECKOUT_SESSION_ID}`
     });
 
     console.log(`✅ Checkout de curso creado: ${slug} para ${email} (${montoCentavos / 100})`);
