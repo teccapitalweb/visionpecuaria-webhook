@@ -305,6 +305,60 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
     return { estado: 'pendiente', folio: null, url: null };
   }
 
+  // ─── ENTRADA DIRECTA TRAS EL PAGO ──────────────────────────────────────────
+  // Al volver de Stripe, la landing manda el session_id. Si el pago está confirmado y el correo NO tenía cuenta,
+  // se crea la cuenta (correo verificado: lo escribió quien pagó) y se entrega un token de un solo uso para entrar
+  // sin pasos extra. Si el correo YA tenía cuenta no se entrega token: pagar con el correo de otra persona no debe
+  // abrir su cuenta; esa persona entra con su acceso de siempre y ve el curso nuevo.
+  const VENTANA_ENTRADA_SEG = 60 * 60;
+  const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
+  app.post('/alumno/entrar-por-pago', async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    try {
+      const sessionId = String(req.body?.sessionId || '').trim();
+      if (!/^cs_[A-Za-z0-9_]{4,250}$/.test(sessionId)) return res.status(400).json({ error: 'Sesión de pago inválida' });
+      let s;
+      try { s = await stripe.checkout.sessions.retrieve(sessionId); }
+      catch (e) { return res.status(404).json({ error: 'No encontramos ese pago' }); }
+      const meta = s.metadata || {};
+      if (meta.tipo !== 'curso' || !meta.slug) return res.status(404).json({ error: 'No encontramos ese pago' });
+      if (s.payment_status !== 'paid' && s.payment_status !== 'no_payment_required') {
+        return res.status(409).json({ error: 'Tu pago aún no se confirma', pendiente: true });
+      }
+      const slug = String(meta.slug);
+      const email = String((s.customer_details && s.customer_details.email) || s.customer_email || meta.email || '').toLowerCase().trim();
+      const base = { ok: true, pagado: true, slug, monto: typeof s.amount_total === 'number' ? s.amount_total / 100 : null };
+      if (!email) return res.json({ ...base, entrada: 'manual' });
+
+      // El acceso lo registra el webhook de Stripe; se le da unos segundos para que el aula ya lo encuentre.
+      const tope = Number(req.body?.esperaMs) >= 0 ? Math.min(Number(req.body.esperaMs), 8000) : 8000;
+      let registrado = false;
+      for (let t = 0; ; t += 500) {
+        registrado = (await db.collection('comprasCurso').doc(sessionId).get()).exists;
+        if (registrado || t >= tope) break;
+        await esperar(500);
+      }
+
+      const reciente = !s.created || (Date.now() / 1000 - Number(s.created)) <= VENTANA_ENTRADA_SEG;
+      const refEntrada = db.collection('entradasPorPago').doc(sessionId);
+      const yaUsada = (await refEntrada.get()).exists;
+      let existente = null;
+      try { existente = await auth.getUserByEmail(email); }
+      catch (e) { if (e.code !== 'auth/user-not-found') throw e; }
+      if (existente || yaUsada || !reciente) return res.json({ ...base, registrado, entrada: 'manual', cuentaExistente: !!existente });
+
+      const nombre = String((s.customer_details && s.customer_details.name) || meta.nombre || '').trim().slice(0, 120);
+      const nuevo = await auth.createUser({ email, emailVerified: true, ...(nombre ? { displayName: nombre } : {}) });
+      await refEntrada.set({ sessionId, slug, email, uid: nuevo.uid, usadaEn: new Date().toISOString() });
+      const token = await auth.createCustomToken(nuevo.uid);
+      log.log(`🎟️ Entrada directa tras el pago: ${slug} → ${nuevo.uid}`);
+      return res.json({ ...base, registrado, entrada: 'token', token });
+    } catch (err) {
+      log.error('❌ /alumno/entrar-por-pago:', err);
+      res.status(500).json({ error: 'No pudimos abrir tu acceso' });
+    }
+  });
+
   // ─── ALUMNO ────────────────────────────────────────────────────────────────
   app.get('/alumno/estado', async (req, res) => {
     try {

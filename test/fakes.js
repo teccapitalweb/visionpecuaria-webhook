@@ -86,7 +86,12 @@ function fakeAuth(users = {}) {
       if (!u) { const e = new Error('no user'); e.code = 'auth/user-not-found'; throw e; }
       return { uid: u.uid, email: u.email, emailVerified: u.email_verified, providerData: [{ providerId: 'google.com' }] };
     },
-    async createUser() { throw new Error('no se usa en pruebas'); }
+    async createUser({ email, emailVerified, displayName }) {
+      const uid = 'nuevo-' + email.replace(/[^a-z0-9]/g, '');
+      users['tok-' + uid] = { uid, email, email_verified: emailVerified === true, name: displayName || '' };
+      return { uid, email, emailVerified: emailVerified === true };
+    },
+    async createCustomToken(uid) { return 'custom-' + uid; }
   };
 }
 

@@ -28,6 +28,11 @@ const users = {
 };
 const stripeSessions = {
   cs_pend: { id: 'cs_pend', payment_status: 'paid', metadata: { tipo: 'curso', slug: 'gallinas-de-postura' } },
+  cs_nuevo: { id: 'cs_nuevo', payment_status: 'paid', created: Math.floor(Date.now() / 1000) - 30, amount_total: 55000, metadata: { tipo: 'curso', slug: 'embutidos-artesanales' }, customer_details: { email: 'Recien@Gmail.com', name: 'Rita Nueva' } },
+  cs_viejo_pago: { id: 'cs_viejo_pago', payment_status: 'paid', created: Math.floor(Date.now() / 1000) - 7200, metadata: { tipo: 'curso', slug: 'embutidos-artesanales' }, customer_details: { email: 'tarde@gmail.com' } },
+  cs_sin_pagar: { id: 'cs_sin_pagar', payment_status: 'unpaid', created: Math.floor(Date.now() / 1000), metadata: { tipo: 'curso', slug: 'embutidos-artesanales' }, customer_details: { email: 'x@gmail.com' } },
+  cs_de_otro: { id: 'cs_de_otro', payment_status: 'paid', created: Math.floor(Date.now() / 1000), metadata: { tipo: 'curso', slug: 'embutidos-artesanales' }, customer_details: { email: 'comprador@gmail.com' } },
+  cs_membresia: { id: 'cs_membresia', payment_status: 'paid', created: Math.floor(Date.now() / 1000), metadata: { tipo: 'membresia' }, customer_details: { email: 'm@gmail.com' } },
   cs_hist: { id: 'cs_hist', payment_status: 'paid', created: 1750000000, amount_total: 42900, customer_email: 'viejo@hotmail.com',
              metadata: { tipo: 'curso', slug: 'gallinas-de-postura', nombre: 'Alumno Viejo' } }
 };
@@ -458,4 +463,37 @@ test('materiales: descripción, categoría y tipo pptx llegan al alumno', async 
   assert.equal(m.categoria, 'Nutrición');
   assert.equal(m.tipo, 'pptx');
   assert.ok(!JSON.stringify(det.data.materiales).includes('b-cdn.net'));
+});
+
+test('entrar por pago: cuenta nueva recibe token de un solo uso; pagos sin confirmar, viejos o ajenos no', async () => {
+  const P = (sessionId) => api('/alumno/entrar-por-pago', { method: 'POST', body: { sessionId, esperaMs: 0 } });
+  assert.equal((await P('basura')).status, 400);
+  assert.equal((await P('cs_no_existe_123')).status, 404);
+  assert.equal((await P('cs_membresia')).status, 404);
+  const sp = await P('cs_sin_pagar');
+  assert.equal(sp.status, 409); assert.equal(sp.data.pendiente, true);
+
+  const r = await P('cs_nuevo');
+  assert.equal(r.status, 200);
+  assert.equal(r.data.entrada, 'token');
+  assert.equal(r.data.slug, 'embutidos-artesanales');
+  assert.equal(r.data.monto, 550);
+  assert.match(r.data.token, /^custom-nuevo-/);
+  assert.equal(db._get('entradasPorPago/cs_nuevo').email, 'recien@gmail.com');
+  // El mismo enlace no vuelve a dar token (ni porque ya se usó ni porque la cuenta ya existe)
+  const r2 = await P('cs_nuevo');
+  assert.equal(r2.data.entrada, 'manual'); assert.equal(r2.data.token, undefined); assert.equal(r2.data.cuentaExistente, true);
+  // Pago de hace 2 h: confirmado, pero sin entrada automática
+  const v = await P('cs_viejo_pago');
+  assert.equal(v.data.entrada, 'manual'); assert.equal(v.data.token, undefined);
+});
+
+test('entrar por pago: pagar con el correo de una cuenta que ya existe NO entrega su sesión', async () => {
+  const r = await api('/alumno/entrar-por-pago', { method: 'POST', body: { sessionId: 'cs_de_otro', esperaMs: 0 } });
+  assert.equal(r.status, 200);
+  assert.equal(r.data.pagado, true);
+  assert.equal(r.data.entrada, 'manual');
+  assert.equal(r.data.cuentaExistente, true);
+  assert.equal(r.data.token, undefined);
+  assert.equal(db._get('entradasPorPago/cs_de_otro'), undefined);
 });
