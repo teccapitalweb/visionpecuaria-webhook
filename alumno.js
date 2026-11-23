@@ -387,6 +387,7 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
           subtitulo: curso.subtitulo || '',
           instructorNombre: curso.instructorNombre || '',
           portada: curso.posterPath || curso.portadaUrl || null,
+          origen: a.origen === 'regalo' ? 'regalo' : 'compra',
           fechaCompra: a.fechaCompra || null,
           totalClases: clases.length,
           progreso: resumenProgreso(prog, clases)
@@ -464,7 +465,7 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
           temario: Array.isArray(curso.temario) ? curso.temario.map(t => ({ n: t.n, titulo: t.titulo })) : [],
           claseEnVivo: curso.linkClaseEnVivo ? { url: curso.linkClaseEnVivo, fecha: curso.fechaClaseEnVivo || null } : null
         },
-        acceso: { fechaCompra: acceso.fechaCompra || null },
+        acceso: { fechaCompra: acceso.fechaCompra || null, origen: acceso.origen === 'regalo' ? 'regalo' : 'compra' },
         clases: clases.map(sinRaw),
         materiales: materiales.map(sinRaw),
         progreso: {
