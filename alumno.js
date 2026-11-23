@@ -18,6 +18,7 @@
 //     "última clase" solo cambia con una marca de tiempo más nueva).
 // ═════════════════════════════════════════════════════════════════════════════
 const crypto = require('crypto');
+const { regaloVigente, aplicarRegalo } = require('./regalos');
 
 const BUCKET_DEFAULT = 'visionpecuaria-vip.firebasestorage.app';
 const URL_FIRMADA_MS = 2 * 60 * 60 * 1000; // 2 h
@@ -241,28 +242,31 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
     const compras = await db.collection('comprasCurso').where('email', '==', email).get();
     for (const d of compras.docs) {
       const c = { sessionId: d.id, ...(d.data() || {}) };
-      if (!c.slug || vigentes[c.slug]) continue;
-      if (directos[c.slug] && directos[c.slug].revocado === true) continue;
+      if (!c.slug) continue;
       if (!(await compraEstaPagada(c))) continue;
-      const acceso = {
-        slug: c.slug,
-        email,
-        nombre: c.nombre || '',
-        activo: true,
-        estado: 'activo',
-        fechaCompra: c.fechaCompra || null,
-        stripeSessionId: c.sessionId,
-        montoPagadoCentavos: c.montoPagadoCentavos || 0,
-        origen: 'conciliacion-correo-verificado',
-        conciliadoEn: new Date().toISOString()
-      };
-      await ref.collection('cursos').doc(c.slug).set(acceso, { merge: true });
-      await ref.set({ email, ultimaActualizacion: acceso.conciliadoEn }, { merge: true });
+      if (!vigentes[c.slug] && !(directos[c.slug] && directos[c.slug].revocado === true)) {
+        const acceso = {
+          slug: c.slug,
+          email,
+          nombre: c.nombre || '',
+          activo: true,
+          estado: 'activo',
+          fechaCompra: c.fechaCompra || null,
+          stripeSessionId: c.sessionId,
+          montoPagadoCentavos: c.montoPagadoCentavos || 0,
+          origen: 'conciliacion-correo-verificado',
+          conciliadoEn: new Date().toISOString()
+        };
+        await ref.collection('cursos').doc(c.slug).set(acceso, { merge: true });
+        await ref.set({ email, ultimaActualizacion: acceso.conciliadoEn }, { merge: true });
+        vigentes[c.slug] = acceso;
+        log.log(`🔗 Acceso conciliado por correo verificado: ${c.slug} → ${u.uid}`);
+      }
+      const bonus = await aplicarRegalo(db, u.uid, c, { email, nombre: c.nombre || '' });
+      if (bonus.otorgado) vigentes[bonus.slug] = (await ref.collection('cursos').doc(bonus.slug).get()).data();
       if (c.uid !== u.uid) {
         await db.collection('comprasCurso').doc(c.sessionId).set({ uidVinculado: u.uid }, { merge: true });
       }
-      vigentes[c.slug] = acceso;
-      log.log(`🔗 Acceso conciliado por correo verificado: ${c.slug} → ${u.uid}`);
     }
     return vigentes;
   }
@@ -337,6 +341,10 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
         registrado = (await db.collection('comprasCurso').doc(sessionId).get()).exists;
         if (registrado || t >= tope) break;
         await esperar(500);
+      }
+      if (registrado) {
+        const compra = (await db.collection('comprasCurso').doc(sessionId).get()).data() || {};
+        if (compra.regalo) base.regalo = compra.regalo;
       }
 
       const reciente = !s.created || (Date.now() / 1000 - Number(s.created)) <= VENTANA_ENTRADA_SEG;
@@ -869,6 +877,7 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
           estado: 'confirmado', fechaCompra: new Date(s.created * 1000).toISOString(),
           montoPagadoCentavos: s.amount_total || 0, recuperadoDesdeStripe: true
         };
+        compra.regalo = await regaloVigente(db, compra.slug, compra.fechaCompra);
         await db.collection('comprasCurso').doc(sessionId).set(compra, { merge: true });
       }
       if (!compra.slug) return res.status(409).json({ error: 'La compra no indica el curso' });
@@ -891,6 +900,7 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
         montoPagadoCentavos: compra.montoPagadoCentavos || 0,
         origen: 'conciliacion-admin', conciliadoEn: ahora, conciliadoPor: a.email || a.uid
       }, { merge: true });
+      await aplicarRegalo(db, usr.uid, compra, { email: emailDestino, nombre: compra.nombre || '' });
       await db.collection('accesosCurso').doc(usr.uid).set({ email: emailDestino, ultimaActualizacion: ahora }, { merge: true });
       await db.collection('comprasCurso').doc(sessionId).set({ uidVinculado: usr.uid }, { merge: true });
       await auditar(a, 'conciliar', { sessionId, slug: compra.slug, uidDestino: usr.uid, emailDestino, emailCompra: compra.email || null, motivo });

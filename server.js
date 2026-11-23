@@ -1,6 +1,7 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const Stripe = require('stripe');
+const { regaloVigente, aplicarRegalo } = require('./regalos');
 
 const app = express();
 
@@ -684,12 +685,14 @@ async function procesarCompraCurso(session) {
         return;
       }
 
-      const fechaISO = new Date().toISOString();
+      // La elegibilidad se fija con la fecha real de la sesión, no con la hora
+      // de un eventual reintento tardío del webhook.
+      const fechaISO = session.created
+        ? new Date(Number(session.created) * 1000).toISOString()
+        : new Date().toISOString();
       const montoCentavos = session.amount_total || 0;
-
-      // 1) COMPRA por sessionId (lo que curso-acceso.html busca primero)
-      //    Esta colección se lee públicamente por session_id sin necesidad de auth
-      await db.collection('comprasCurso').doc(session.id).set({
+      const regalo = await regaloVigente(db, slug, fechaISO);
+      const compra = {
         sessionId: session.id,
         slug,
         uid: uid || null,
@@ -699,8 +702,13 @@ async function procesarCompraCurso(session) {
         estado: 'confirmado',
         fechaCompra: fechaISO,
         montoPagadoCentavos: montoCentavos,
-        stripeCustomerId: session.customer || null
-      }, { merge: true });
+        stripeCustomerId: session.customer || null,
+        ...(regalo ? { regalo } : {})
+      };
+
+      // 1) COMPRA por sessionId (lo que curso-acceso.html busca primero)
+      //    Esta colección se lee públicamente por session_id sin necesidad de auth
+      await db.collection('comprasCurso').doc(session.id).set(compra, { merge: true });
       console.log(`✅ comprasCurso/${session.id} creado`);
 
       // 2) ACCESO al curso por uid (para lista de cursos comprados)
@@ -725,6 +733,10 @@ async function procesarCompraCurso(session) {
           ultimaActualizacion: fechaISO
         }, { merge: true });
         console.log(`✅ accesosCurso/${uid}/cursos/${slug} creado`);
+        if (regalo) {
+          const bonus = await aplicarRegalo(db, uid, compra, { email, nombre });
+          if (bonus.otorgado) console.log(`🎁 accesosCurso/${uid}/cursos/${bonus.slug} creado`);
+        }
       }
 
       // 3) INCREMENTAR cupo tomado del curso (para el contador de la landing)
