@@ -105,6 +105,8 @@ function normalizarMateriales(recursosRaw) {
   return (Array.isArray(recursosRaw) ? recursosRaw : []).map((r, i) => {
     r = r || {};
     const ruta = String(r.url || r.storagePath || '');
+    const miniaturaRaw = String(r.miniatura || r.portada || '').trim();
+    const miniatura = /^https:\/\/[a-z0-9-]+\.b-cdn\.net\/[\w\-./%() ]+$/i.test(miniaturaRaw) ? miniaturaRaw : null;
     const ext = (ruta.match(/\.(pdf|pptx?|docx?|xlsx?|zip)($|\?)/i) || [])[1];
     const tipo = String(r.tipo || '').toLowerCase() || (ext ? ext.toLowerCase().replace(/^(ppt|doc|xls)$/, '$1x') : 'pdf');
     return {
@@ -114,6 +116,7 @@ function normalizarMateriales(recursosRaw) {
       categoria: r.categoria || '',
       tipo,
       claseId: r.claseId ? String(r.claseId) : null,
+      miniatura,
       disponible: !!(r.storagePath || r.url || r.driveUrl),
       _raw: r
     };
@@ -788,9 +791,14 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
         const titulo = String(r && r.titulo || '').trim().slice(0, 160);
         const storagePath = String(r && r.storagePath || '').trim();
         const url = String(r && r.url || '').trim();
+        const miniatura = String(r && (r.miniatura || r.portada) || '').trim();
         const extra = {};
         const desc = String(r && r.descripcion || '').trim().slice(0, 280); if (desc) extra.descripcion = desc;
         const cat = String(r && r.categoria || '').trim().slice(0, 40); if (cat) extra.categoria = cat;
+        if (miniatura) {
+          if (!/^https:\/\/[a-z0-9-]+\.b-cdn\.net\/[\w\-./%() ]+$/i.test(miniatura)) throw Object.assign(new Error('Portada de Bunny inválida en el recurso ' + (i + 1)), { http: 400 });
+          extra.miniatura = miniatura;
+        }
         if (!titulo) throw Object.assign(new Error('Título vacío en el recurso ' + (i + 1)), { http: 400 });
         if (url) {
           // Bunny Storage servido por su Pull Zone (*.b-cdn.net)
