@@ -117,4 +117,4 @@ function orientacionBase(textoNormalizado, cursoSlug, historialNormalizado = [])
   return null;
 }
 
-module.exports = { orientacionBase };
+module.exports = { orientacionBase, pideVigencia };

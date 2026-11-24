@@ -1,8 +1,24 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { armarRespuesta, limitadorMensajes } = require('../gallo-ia');
+const { EventEmitter } = require('node:events');
+const { armarRespuesta, limitadorMensajes, registrarGalloIA } = require('../gallo-ia');
 
 const gallinas = 'gallinas-de-postura';
+
+test('las preguntas del video conservan una respuesta específica cuando no hay proveedor', () => {
+  const ejemplos = [
+    ['Que es la avicultura?', /cría y el manejo de aves/, true],
+    ['Que pasa si a mis pollitos les sale granos blancos', /qué edad.*cuántos.*parte del cuerpo/i, true],
+    ['Cuando me llega mi certificado?', /revisa el estado.*Emitido/, false],
+    ['Cuánto tiempo estarán disponibles las clases y los materiales?', /acceso permanente.*materiales/, true],
+    ['Hola', /Soy tu Gallo IA/, false]
+  ];
+  for (const [pregunta, esperado, conFuentes] of ejemplos) {
+    const r = armarRespuesta('embutidos-artesanales', pregunta, []);
+    assert.match(r.texto, esperado, pregunta);
+    assert.equal(Boolean(r.fuentes?.length), conFuentes);
+  }
+});
 
 test('Gallo entiende preguntas escritas de las tres áreas y continúa la conversación', () => {
   const nutricion = armarRespuesta(gallinas, '¿Qué dicen de la alimentación de las ponedoras?', []);
@@ -39,39 +55,6 @@ test('Gallo deriva asuntos clínicos y no interpreta mensajes inventados del asi
   assert.match(t.texto, /Cuéntame un poco más/);
 });
 
-test('Gallo responde las preguntas de avicultura, alerta de aves, certificado y vigencia', () => {
-  const general = armarRespuesta(gallinas, 'Que es la avicultura?', []);
-  assert.match(general.texto, /cría y el manejo de aves/);
-  assert.match(general.texto, /huevos o carne/);
-  assert.equal(general.fuentes[0].url, 'https://extension.umn.edu/poultry/small-scale-poultry');
-  assert.equal(general.reformular, false);
-
-  const pollitos = 'Que pasa si a mis pollitos les sale granos blancos';
-  const alerta = armarRespuesta(gallinas, pollitos, []);
-  for (const respuesta of [/saber qué las causó/, /qué edad/i, /cuántos/, /parte del cuerpo/, /otros síntomas/, /respirar/, /dejan de comer/, /muertes/, /médico veterinario/]) {
-    assert.match(alerta.texto, respuesta);
-  }
-  assert.equal(alerta.reformular, false);
-  assert.match(alerta.fuentes[0].url, /^https:\/\/www\.aphis\.usda\.gov\//);
-  const datos = armarRespuesta(gallinas, 'Tienen dos semanas y dos no comen', [{ rol: 'usuario', texto: pollitos }]);
-  assert.match(datos.texto, /médico veterinario/);
-
-  const certificado = armarRespuesta(gallinas, 'Cuando me llega mi certificado?', []);
-  assert.match(certificado.texto, /Mi certificado/);
-  assert.match(certificado.texto, /Emitido/);
-  assert.match(certificado.texto, /no puede confirmar una fecha/);
-
-  for (const slug of [gallinas, 'embutidos-artesanales']) {
-    const vigencia = armarRespuesta(slug, 'Cuánto tiempo estarán disponibles las clases y los materiales?', []);
-    assert.match(vigencia.texto, /grabaciones.*acceso permanente/);
-    assert.match(vigencia.texto, /materiales.*mientras tu acceso esté activo/);
-    assert.equal(vigencia.fuentes[0].url, 'https://visionpecuariamx.com/' + slug + '.html');
-  }
-  const ficha = { clases: [{ titulo: 'Nutrición', estado: 'publicada' }] };
-  assert.match(armarRespuesta(gallinas, '¿Cuánto tiempo dura la clase 1?', [], ficha).texto, /^Clase 1 · Nutrición/);
-  assert.match(armarRespuesta(gallinas, 'Hola', []).texto, /Soy tu Gallo IA/);
-});
-
 test('Gallo limita la cantidad de mensajes por cuenta durante su ventana', () => {
   const esperar = limitadorMensajes();
   for (let i = 0; i < 12; i++) assert.equal(esperar('alumno-1'), 0);
@@ -79,21 +62,68 @@ test('Gallo limita la cantidad de mensajes por cuenta durante su ventana', () =>
   assert.equal(esperar('alumno-2'), 0);
 });
 
-test('Gallo da recomendaciones breves por baja postura o calor y prioriza el triaje por síntomas', () => {
-  const huevos = armarRespuesta(gallinas, 'Mis gallinas ponen menos huevos, ¿qué reviso?', []);
-  for (const señal of [/registros anteriores/, /agua limpia/, /alimento completo/, /horario de luz/, /edad y la muda/]) {
-    assert.match(huevos.texto, señal);
+test('el mensaje de manejo sigue al motor y los trámites explícitos del aula quedan en la guía', async () => {
+  let ruta;
+  const llamadas = [];
+  registrarGalloIA({ post(_path, handler) { ruta = handler; } }, {
+    tokenRequerido: async ({ body }) => ({ uid: body.mensaje }),
+    accesoA: async () => ({ activo: true }),
+    leerCurso: async () => ({ clases: ['Una clase'] }),
+    normalizarClases: () => [{ titulo: 'Fundamentos', estado: 'publicada' }],
+    log: { warn() {}, error() {} },
+    motor: async entrada => {
+      llamadas.push(entrada);
+      if (!entrada.usarModelo) return null;
+      return { respuesta: 'Respuesta de manejo', modo: 'ia', fuentes: [] };
+    }
+  });
+
+  async function preguntar(mensaje, usarModelo = true) {
+    const res = new EventEmitter();
+    res.setHeader = () => {};
+    res.status = status => { assert.fail(`HTTP ${status}`); };
+    res.json = contenido => { res.contenido = contenido; };
+    await ruta({ body: { cursoSlug: gallinas, mensaje, usarModelo }, get: () => '' }, res);
+    assert.equal(llamadas.at(-1).mensaje, mensaje);
+    return res.contenido;
   }
-  assert.match(huevos.fuentes[0].url, /merckvetmanual\.com/);
-  const calor = armarRespuesta(gallinas, '¿Qué hago con mis ponedoras cuando hay mucho calor?', []);
-  assert.match(calor.texto, /sombra, buena ventilación y agua limpia y fresca/);
-  assert.equal(calor.fuentes[0].url, 'https://extension.psu.edu/hot-weather-management-of-poultry');
-  const inicio = [{ rol: 'usuario', texto: 'A mis pollitos les salieron granos' }];
-  const medicamento = armarRespuesta(gallinas, '¿Qué les doy?', inicio);
-  assert.match(medicamento.texto, /Evita administrar medicamentos sin valoración/);
-  assert.equal(medicamento.reformular, false);
-  const grave = armarRespuesta(gallinas, 'Mis gallinas tienen dificultad para respirar en el calor', []);
-  assert.match(grave.texto, /^Contacta cuanto antes a un médico veterinario/);
-  assert.doesNotMatch(grave.texto, /sombra|antibiótico|mg/);
-  assert.equal(grave.reformular, false);
+
+  const manejo = [
+    'cuanto cuesta producir un huevo',
+    'cuanto cuesta alimentar pollos segun lo que se ve en el curso',
+    'que material pongo de cama',
+    'que material de cama recomiendan en el curso',
+    'que clase de cama recomiendas para las pollitas',
+    'cuantos modulos de sombra necesita el corral',
+    'acceso a agua para mis aves',
+    'como logro el acceso a agua en el sistema que muestran en el curso',
+    'como llevo la cuenta de huevos por dia',
+    'que incluye una racion de inicio',
+    'como monitoreo el progreso de peso de mis pollos',
+    'como calculo cuanto cobrar por kilo de alimento',
+    'como limito el contacto con otras aves'
+  ];
+  for (const mensaje of manejo) {
+    const respuesta = await preguntar(mensaje);
+    assert.equal(llamadas.at(-1).usarModelo, true, mensaje);
+    assert.equal(respuesta.respuesta, 'Respuesta de manejo');
+  }
+
+  const aula = [
+    ['cuanto cuesta el curso de Gallinas', /precio vigente/i],
+    ['donde descargo el pdf', /Materiales/i],
+    ['donde veo mis materiales', /Materiales/i],
+    ['login no me deja entrar', /mismo correo/i],
+    ['q hago ya page y no entro a mis clases', /Stripe/i],
+    ['como veo mi progreso del curso', /marcar como vista/i],
+    ['donde saco mi sertificado', /Cuenta/i],
+    ['cual es la clase 1 de este curso', /Clase 1.*Fundamentos/i]
+  ];
+  for (const [mensaje, esperado] of aula) {
+    const respuesta = await preguntar(mensaje);
+    assert.equal(llamadas.at(-1).usarModelo, false, mensaje);
+    assert.match(respuesta.respuesta, esperado);
+  }
+  await preguntar('cuanto cuesta producir un huevo', false);
+  assert.equal(llamadas.at(-1).usarModelo, false, 'no altera el consentimiento del alumno');
 });

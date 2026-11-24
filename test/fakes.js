@@ -61,6 +61,7 @@ class FakeQuery {
       .filter(([k]) => k.startsWith(this.path + '/') && k.split('/').length === depth)
       .filter(([, v]) => this.filters.every(([f, op, val]) => {
         if (op === '>=') return v[f] >= val;
+        if (op === 'array-contains-any') return Array.isArray(v[f]) && val.some(term => v[f].includes(term));
         return v[f] === val;
       }))
       .map(([k, v]) => new FakeSnap(k.split('/').pop(), clone(v), new FakeDoc(this.db, k)));
