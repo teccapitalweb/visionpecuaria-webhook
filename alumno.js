@@ -20,6 +20,7 @@
 const crypto = require('crypto');
 const { regaloVigente, aplicarRegalo } = require('./regalos');
 const { registrarMetricasPromocion } = require('./promocion-analytics');
+const { registrarGalloIA } = require('./gallo-ia');
 
 const BUCKET_DEFAULT = 'visionpecuaria-vip.firebasestorage.app';
 const URL_FIRMADA_MS = 2 * 60 * 60 * 1000; // 2 h
@@ -189,6 +190,7 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
   }
 
   registrarMetricasPromocion(app, { db, tokenRequerido, adminRequerido, log });
+  registrarGalloIA(app, { tokenRequerido, accesoA, leerCurso, normalizarClases, log });
 
   async function auditar(adminUser, accion, datos) {
     await db.collection('auditoriaCursos').add({
@@ -823,6 +825,53 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
   });
 
   // ─── ADMIN: conciliación de compras históricas ─────────────────────────────
+  app.get('/admin/cursos/compras', async (req, res) => {
+    res.setHeader('Cache-Control', 'private, no-store');
+    try {
+      const a = await adminRequerido(req, res); if (!a) return;
+      const { slug } = req.query;
+      if (slug !== undefined && (typeof slug !== 'string' || !/^[a-z0-9-]{1,120}$/.test(slug))) {
+        return res.status(400).json({ error: 'Curso inválido' });
+      }
+      // Se lee una ventana reciente más amplia al filtrar por curso, sin exigir índices nuevos.
+      const limiteConsulta = slug ? 501 : 101;
+      const snap = await db.collection('comprasCurso').orderBy('fechaCompra', 'desc').limit(limiteConsulta).get();
+      const coincidencias = snap.docs.map(d => ({ ...d.data(), sessionId: d.id }))
+        .filter(c => typeof c.slug === 'string' && /^[a-z0-9-]{1,120}$/.test(c.slug) && (!slug || c.slug === slug));
+      const consultas = new Map();
+      const compras = await Promise.all(coincidencias.slice(0, 100).map(async c => {
+        const uids = new Set([c.uidVinculado, c.uid]);
+        let acceso = null;
+        for (const uid of uids) {
+          if (typeof uid !== 'string' || !uid || uid.includes('/') || uid.length > 128) continue;
+          const clave = JSON.stringify([uid, c.slug]);
+          if (!consultas.has(clave)) consultas.set(clave, db.collection('accesosCurso').doc(uid).collection('cursos').doc(c.slug).get());
+          const snapAcceso = await consultas.get(clave);
+          if (!snapAcceso.exists) continue;
+          const estado = snapAcceso.data();
+          const revocado = estado.revocado === true || estado.estado === 'revocado';
+          acceso = { uid, activo: !revocado && (estado.activo === true || estado.estado === 'activo'), revocado };
+          break;
+        }
+        return {
+          sessionId: c.sessionId,
+          slug: c.slug,
+          estado: c.estado || '',
+          email: c.email || '',
+          nombre: c.nombre || '',
+          fechaCompra: c.fechaCompra || null,
+          montoPagadoCentavos: Number.isFinite(c.montoPagadoCentavos) ? c.montoPagadoCentavos : null,
+          moneda: c.moneda || 'mxn',
+          acceso
+        };
+      }));
+      return res.json({ compras, truncado: coincidencias.length > 100 || snap.docs.length === limiteConsulta });
+    } catch (err) {
+      log.error('❌ /admin/cursos/compras:', err.code || err.name);
+      return res.status(500).json({ error: 'No pudimos consultar las compras' });
+    }
+  });
+
   app.get('/admin/cursos/buscar', async (req, res) => {
     try {
       const a = await adminRequerido(req, res); if (!a) return;

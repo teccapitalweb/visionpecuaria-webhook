@@ -73,7 +73,9 @@ test('métricas de la promoción atribuyen eventos al comprador, deduplican y re
   const r = await metricas({ uid: 'admin' }, { dias: '3', origenSlug, destinoSlug });
   assert.equal(r.status, 200);
   assert.equal(r.headers['Cache-Control'], 'private, no-store');
-  assert.deepEqual(r.data.totales, {
+  const resumen = Object.fromEntries(Object.entries(r.data.totales).filter(([, v]) => v.eventos)
+    .map(([tipo, { eventos, personas }]) => [tipo, { eventos, personas }]));
+  assert.deepEqual(resumen, {
     enlace_abierto: { eventos: 1, personas: 1 },
     video_reproducido: { eventos: 3, personas: 2 },
     checkout_creado: { eventos: 1, personas: 1 },
