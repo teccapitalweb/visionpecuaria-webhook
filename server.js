@@ -1,6 +1,9 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const Stripe = require('stripe');
+const { regaloVigente, aplicarRegalo } = require('./regalos');
+const { obtenerOfertaPromocional, precioVigenteCentavos } = require('./promociones-cursos');
+const { guardarEventoPromo } = require('./promocion-analytics');
 
 const app = express();
 
@@ -405,17 +408,55 @@ app.post('/crear-checkout', async (req, res) => {
 //     Recibe: { slug, uid, email, nombre, whatsapp }
 //     Devuelve: { clientSecret }
 // ═════════════════════════════════════════════════════════════════════════════
+function responderErrorPromocion(res, err) {
+  return res.status(err.status).json({
+    error: err.message,
+    ...(err.codigo ? { codigo: err.codigo } : {}),
+    ...(err.yaComprado ? { yaComprado: true, sessionId: null } : {})
+  });
+}
+
+app.get('/alumno/promociones/cotizacion', async (req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const usuario = await autenticarSolicitud(req, res);
+  if (!usuario) return;
+  try {
+    const origenSlug = sanearTexto(req.query.origenSlug);
+    const destinoSlug = sanearTexto(req.query.destinoSlug);
+    res.json(await obtenerOfertaPromocional(db, usuario, origenSlug, destinoSlug));
+  } catch (err) {
+    if (err.status) return responderErrorPromocion(res, err);
+    console.error('❌ Error cotización de curso:', err);
+    res.status(500).json({ error: 'No pudimos consultar la promoción' });
+  }
+});
+
 app.post('/crear-checkout-curso', async (req, res) => {
   try {
-    const { slug: slugRaw, uid: uidRaw, email: emailRaw, nombre: nombreRaw, whatsapp: whatsappRaw } = req.body;
+    const { slug: slugRaw, uid: uidRaw, email: emailRaw, nombre: nombreRaw, whatsapp: whatsappRaw, origenSlug: origenRaw } = req.body || {};
 
     const slug = sanearTexto(slugRaw);
-    const email = (emailRaw || '').toLowerCase().trim();
-    const uid = sanearTexto(uidRaw);
-    const nombre = sanearTexto(nombreRaw);
+    const origenSlug = sanearTexto(origenRaw);
+    let email = sanearTexto(emailRaw).toLowerCase();
+    let uid = sanearTexto(uidRaw);
+    let nombre = sanearTexto(nombreRaw);
     const whatsapp = sanearTexto(whatsappRaw).replace(/\D/g, '');
 
     if (!slug) return res.status(400).json({ error: 'Slug del curso requerido' });
+    let oferta;
+    if (origenSlug) {
+      res.setHeader('Cache-Control', 'private, no-store');
+      const usuario = await autenticarSolicitud(req, res);
+      if (!usuario) return;
+      try { oferta = await obtenerOfertaPromocional(db, usuario, origenSlug, slug); }
+      catch (err) {
+        if (err.status) return responderErrorPromocion(res, err);
+        throw err;
+      }
+      uid = usuario.uid;
+      email = usuario.email.toLowerCase().trim();
+      nombre = sanearTexto(usuario.name);
+    }
     // email/nombre/whatsapp son opcionales: el checkout directo deja que Stripe
     // recoja correo, nombre y teléfono en su propio formulario (como Sinergia).
 
@@ -431,9 +472,7 @@ app.post('/crear-checkout-curso', async (req, res) => {
     }
 
     // 2) Determinar precio (lanzamiento si aplica, si no el normal)
-    let montoCentavos = curso.precioLanzamientoCentavos ?? curso.precioNormalCentavos;
-    if (!montoCentavos && curso.precioLanzamiento) montoCentavos = Math.round(curso.precioLanzamiento * 100);
-    if (!montoCentavos && curso.precioNormal)     montoCentavos = Math.round(curso.precioNormal * 100);
+    const montoCentavos = oferta?.montoCentavos ?? precioVigenteCentavos(curso);
     if (!montoCentavos) return res.status(400).json({ error: 'El curso no tiene precio configurado' });
 
     // 3) ¿Ya compró este curso?
@@ -455,14 +494,16 @@ app.post('/crear-checkout-curso', async (req, res) => {
 
     // 4) Crear Stripe Checkout Session (modo payment, no subscription)
     const nombreCurso = curso.nombre || curso.titulo || 'Curso Visión Pecuaria';
+    // Stripe fija el correo al usar un Customer con email. Un prellenado por sí solo se puede editar.
+    const clientePromo = oferta ? await stripe.customers.create({ email, ...(nombre ? { name: nombre } : {}), metadata: { uid } }) : null;
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       ui_mode: 'embedded',
-      ...(email ? { customer_email: email } : {}),
+      ...(clientePromo ? { customer: clientePromo.id, client_reference_id: uid } : email ? { customer_email: email } : {}),
       phone_number_collection: { enabled: true },
       line_items: [{
         price_data: {
-          currency: curso.moneda || 'mxn',
+          currency: oferta?.moneda || curso.moneda || 'mxn',
           product_data: {
             name: nombreCurso,
             description: curso.subtitulo || 'Curso online Visión Pecuaria'
@@ -471,14 +512,15 @@ app.post('/crear-checkout-curso', async (req, res) => {
         },
         quantity: 1
       }],
-      allow_promotion_codes: true,
+      allow_promotion_codes: !oferta,
       metadata: {
         tipo: 'curso',
         slug,
         uid,
         nombre,
         whatsapp,
-        email
+        email,
+        ...(oferta ? { promoOrigenSlug: origenSlug, promoDescuentoCentavos: String(oferta.descuentoCentavos) } : {})
       },
       // Gallinas y Embutidos tienen el aula dentro de su propia landing: al pagar se vuelve ahí y se entra directo.
       return_url: AULA_EN_LANDING[slug]
@@ -486,10 +528,18 @@ app.post('/crear-checkout-curso', async (req, res) => {
         : `${SITIO_URL}/curso-acceso.html?slug=${encodeURIComponent(slug)}&session_id={CHECKOUT_SESSION_ID}`
     });
 
+    if (oferta) {
+      try {
+        await guardarEventoPromo(db, { origenSlug, destinoSlug: slug, tipo: 'checkout_creado', eventoId: session.id, uid, email, nombre });
+      } catch (err) {
+        console.warn('No se pudo registrar el checkout promocional:', err.message);
+      }
+    }
     console.log(`✅ Checkout de curso creado: ${slug} para ${email} (${montoCentavos / 100})`);
     res.json({
       clientSecret: session.client_secret,
-      sessionId: session.id
+      sessionId: session.id,
+      ...(oferta ? { oferta } : {})
     });
 
   } catch (err) {
@@ -684,12 +734,14 @@ async function procesarCompraCurso(session) {
         return;
       }
 
-      const fechaISO = new Date().toISOString();
+      // La elegibilidad se fija con la fecha real de la sesión, no con la hora
+      // de un eventual reintento tardío del webhook.
+      const fechaISO = session.created
+        ? new Date(Number(session.created) * 1000).toISOString()
+        : new Date().toISOString();
       const montoCentavos = session.amount_total || 0;
-
-      // 1) COMPRA por sessionId (lo que curso-acceso.html busca primero)
-      //    Esta colección se lee públicamente por session_id sin necesidad de auth
-      await db.collection('comprasCurso').doc(session.id).set({
+      const regalo = await regaloVigente(db, slug, fechaISO);
+      const compra = {
         sessionId: session.id,
         slug,
         uid: uid || null,
@@ -699,8 +751,13 @@ async function procesarCompraCurso(session) {
         estado: 'confirmado',
         fechaCompra: fechaISO,
         montoPagadoCentavos: montoCentavos,
-        stripeCustomerId: session.customer || null
-      }, { merge: true });
+        stripeCustomerId: session.customer || null,
+        ...(regalo ? { regalo } : {})
+      };
+
+      // 1) COMPRA por sessionId (lo que curso-acceso.html busca primero)
+      //    Esta colección se lee públicamente por session_id sin necesidad de auth
+      await db.collection('comprasCurso').doc(session.id).set(compra, { merge: true });
       console.log(`✅ comprasCurso/${session.id} creado`);
 
       // 2) ACCESO al curso por uid (para lista de cursos comprados)
@@ -725,6 +782,10 @@ async function procesarCompraCurso(session) {
           ultimaActualizacion: fechaISO
         }, { merge: true });
         console.log(`✅ accesosCurso/${uid}/cursos/${slug} creado`);
+        if (regalo) {
+          const bonus = await aplicarRegalo(db, uid, compra, { email, nombre });
+          if (bonus.otorgado) console.log(`🎁 accesosCurso/${uid}/cursos/${bonus.slug} creado`);
+        }
       }
 
       // 3) INCREMENTAR cupo tomado del curso (para el contador de la landing)

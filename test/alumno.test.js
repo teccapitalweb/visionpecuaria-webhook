@@ -36,6 +36,7 @@ const stripeSessions = {
   cs_hist: { id: 'cs_hist', payment_status: 'paid', created: 1750000000, amount_total: 42900, customer_email: 'viejo@hotmail.com',
              metadata: { tipo: 'curso', slug: 'gallinas-de-postura', nombre: 'Alumno Viejo' } }
 };
+const stripeMock = fakeStripe(stripeSessions);
 
 // ─── Inyectar dobles antes de cargar server.js ──────────────────────────────
 const origLoad = Module._load;
@@ -49,7 +50,7 @@ Module._load = function (req, ...rest) {
       auth: () => fakeAuth(users)
     };
   }
-  if (req === 'stripe') return () => fakeStripe(stripeSessions);
+  if (req === 'stripe') return () => stripeMock;
   return origLoad.call(this, req, ...rest);
 };
 process.env.FIREBASE_SERVICE_ACCOUNT = '{}';
@@ -75,10 +76,10 @@ async function semilla() {
   s('cursosVenta/embutidos-artesanales', {
     nombre: 'Embutidos artesanales y chorizos',
     clases: [{ orden: 1, titulo: 'Clase 1', storagePath: 'cursos/embutidos-artesanales/clase-01.mp4' }],
-    recursosDescargables: [], cupoLanzamientoTomados: 0, precioNormalCentavos: 55000
+    recursosDescargables: [], cupoLanzamientoTomados: 0, precioNormalCentavos: 105000, precioLanzamientoCentavos: 55000
   });
   // Compra histórica de Gallinas: checkout sin sesión → uid sintético
-  s('comprasCurso/cs_gal', { sessionId: 'cs_gal', slug: 'gallinas-de-postura', uid: sint('comprador@gmail.com'), email: 'comprador@gmail.com', estado: 'confirmado', fechaCompra: '2026-09-10T00:00:00Z' });
+  s('comprasCurso/cs_gal', { sessionId: 'cs_gal', slug: 'gallinas-de-postura', uid: sint('comprador@gmail.com'), email: 'comprador@gmail.com', estado: 'confirmado', fechaCompra: '2026-09-10T00:00:00Z', montoPagadoCentavos: 45000 });
   s(`accesosCurso/${sint('comprador@gmail.com')}/cursos/gallinas-de-postura`, { activo: true, slug: 'gallinas-de-postura' });
   // Embutidos con uid real (Google en checkout)
   s('accesosCurso/u-emb/cursos/embutidos-artesanales', { activo: true, slug: 'embutidos-artesanales', fechaCompra: '2026-08-01' });
@@ -93,9 +94,9 @@ async function semilla() {
   s('comprasCurso/cs_venc', { slug: 'gallinas-de-postura', email: 'venc@gmail.com', estado: 'confirmado' });
   // Acceso revocado
   s('accesosCurso/u-rev/cursos/gallinas-de-postura', { activo: false, revocado: true });
-  s('comprasCurso/cs_rev', { slug: 'gallinas-de-postura', email: 'rev@gmail.com', estado: 'confirmado' });
+  s('comprasCurso/cs_rev', { slug: 'gallinas-de-postura', email: 'rev@gmail.com', estado: 'confirmado', montoPagadoCentavos: 45000 });
   // Dos compras
-  s('comprasCurso/cs_dos1', { slug: 'gallinas-de-postura', email: 'dos@gmail.com', estado: 'confirmado' });
+  s('comprasCurso/cs_dos1', { slug: 'gallinas-de-postura', email: 'dos@gmail.com', estado: 'confirmado', montoPagadoCentavos: 45000 });
   s('comprasCurso/cs_dos2', { slug: 'embutidos-artesanales', email: 'dos@gmail.com', estado: 'confirmado' });
   // Pago OXXO que ya se acreditó en Stripe pero el webhook no llegó
   s('comprasCurso/cs_pend', { sessionId: 'cs_pend', slug: 'gallinas-de-postura', email: 'oxxo@gmail.com', estado: 'pendiente' });
@@ -297,6 +298,58 @@ test('checkout: "ya comprado" no devuelve el sessionId', async () => {
   assert.equal(r.data.sessionId, null);
 });
 
+test('la promoción valida un pago de Gallinas y descuenta 100 MXN al precio vigente de Embutidos', async () => {
+  const origenSlug = 'gallinas-de-postura', destinoSlug = 'embutidos-artesanales';
+  const cotizacion = `/alumno/promociones/cotizacion?origenSlug=${origenSlug}&destinoSlug=${destinoSlug}`;
+  const oferta = await api(cotizacion, { token: 'tGallinas' });
+  assert.equal(oferta.status, 200);
+  assert.equal(oferta.data.moneda, 'mxn');
+  assert.equal(oferta.data.precioBaseCentavos, 55000);
+  assert.equal(oferta.data.montoCentavos, 45000);
+  assert.equal(oferta.data.descuentoCentavos, 10000);
+
+  const compra = await api('/crear-checkout-curso', {
+    method: 'POST', token: 'tGallinas', body: { origenSlug, slug: destinoSlug, uid: 'u-otro', email: 'otro@gmail.com', montoCentavos: 1 }
+  });
+  assert.equal(compra.status, 200);
+  assert.deepEqual(compra.data.oferta, oferta.data);
+  const cliente = stripeMock.clientesCreados.at(-1);
+  const stripe = stripeMock.checkoutCreados.at(-1);
+  assert.equal(cliente.email, users.tGallinas.email);
+  assert.equal(cliente.metadata.uid, users.tGallinas.uid);
+  assert.match(stripe.customer, /^cus_test_promo_/);
+  assert.equal(stripe.customer_email, undefined);
+  assert.equal(stripe.metadata.uid, users.tGallinas.uid);
+  assert.equal(stripe.metadata.email, users.tGallinas.email);
+  assert.equal(stripe.metadata.promoOrigenSlug, origenSlug);
+  assert.equal(stripe.allow_promotion_codes, false);
+  assert.equal(stripe.line_items[0].price_data.unit_amount, 45000);
+
+  const normal = await api('/crear-checkout-curso', { method: 'POST', body: { slug: destinoSlug } });
+  assert.equal(normal.status, 200);
+  assert.equal(normal.data.oferta, undefined);
+  assert.equal(stripeMock.checkoutCreados.at(-1).allow_promotion_codes, true);
+  assert.equal(stripeMock.checkoutCreados.at(-1).line_items[0].price_data.unit_amount, 55000);
+});
+
+test('la promoción rechaza enlaces sin sesión, gratuitos, revocados o con destino ya adquirido', async () => {
+  const path = '/alumno/promociones/cotizacion?origenSlug=gallinas-de-postura&destinoSlug=embutidos-artesanales';
+  const n = stripeMock.checkoutCreados.length;
+  assert.equal((await api(path)).status, 401);
+  assert.equal((await api(path, { token: 'tSinVerif' })).status, 403);
+  assert.equal((await api(path, { token: 'tVencido' })).status, 403);
+  assert.equal((await api(path, { token: 'tRevocado' })).status, 403);
+  assert.equal((await api(path.replace('gallinas-de-postura', 'sexaje-avicola'), { token: 'tGallinas' })).status, 404);
+  const adquirida = await api(path, { token: 'tDos' });
+  assert.equal(adquirida.status, 409);
+  assert.equal(adquirida.data.codigo, 'curso_adquirido');
+  const checkout = await api('/crear-checkout-curso', {
+    method: 'POST', token: 'tOtro', body: { origenSlug: 'gallinas-de-postura', slug: 'embutidos-artesanales', uid: 'u-gallinas', email: 'comprador@gmail.com' }
+  });
+  assert.equal(checkout.status, 403);
+  assert.equal(stripeMock.checkoutCreados.length, n);
+});
+
 // ─── Bunny + solicitudes de certificado ─────────────────────────────────────
 const G1 = '573d362b-7d72-4292-a568-e60089854555';
 const G2 = 'f7a42c9b-46c4-4296-8388-7951a3784d8d';
@@ -455,14 +508,16 @@ test('materiales con URL de Bunny: el listado no la expone y /material la entreg
 
 test('materiales: descripción, categoría y tipo pptx llegan al alumno', async () => {
   const url = 'https://visionpecuariamateriales.b-cdn.net/Modulo_02_Nutricion.pptx';
-  const r = await api('/admin/cursos/materiales', { token: 'tAdmin', method: 'POST', body: { slug: 'gallinas-de-postura', recursos: [{ titulo: 'Módulo 02', url, descripcion: 'Requerimientos por etapa', categoria: 'Nutrición' }] } });
+  const miniatura = 'https://visionpecuariamateriales.b-cdn.net/portada-modulo-02.png';
+  const r = await api('/admin/cursos/materiales', { token: 'tAdmin', method: 'POST', body: { slug: 'gallinas-de-postura', recursos: [{ titulo: 'Módulo 02', url, miniatura, descripcion: 'Requerimientos por etapa', categoria: 'Nutrición' }] } });
   assert.equal(r.status, 200);
   const det = await api('/alumno/curso/gallinas-de-postura', { token: 'tGallinas' });
   const m = det.data.materiales[0];
   assert.equal(m.descripcion, 'Requerimientos por etapa');
   assert.equal(m.categoria, 'Nutrición');
   assert.equal(m.tipo, 'pptx');
-  assert.ok(!JSON.stringify(det.data.materiales).includes('b-cdn.net'));
+  assert.equal(m.miniatura, miniatura);
+  assert.ok(!JSON.stringify(det.data.materiales).includes('Modulo_02_Nutricion.pptx'));
 });
 
 test('entrar por pago: cuenta nueva recibe token de un solo uso; pagos sin confirmar, viejos o ajenos no', async () => {
