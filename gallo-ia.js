@@ -1,5 +1,6 @@
 const { setTimeout: esperarFragmento } = require('node:timers/promises');
 const { crearMotorGallo, limpiarHistorial, VERSION_MOTOR } = require('./gallo-motor');
+const { orientacionBase, pideVigencia } = require('./gallo-orientacion');
 
 const CURSOS = {
   'gallinas-de-postura': {
@@ -42,6 +43,7 @@ const MAX_HISTORIAL = 8;
 const MAX_CUENTAS = 3000;
 const VENTANA_MS = 60 * 1000;
 const MAX_POR_VENTANA = 12;
+const SALUDO = /^(hola|buenos dias|buenas tardes|buenas noches|buenas|que tal|hey)( (mi )?gallo( ia)?)?$/;
 
 function normalizar(texto) {
   return texto.toLowerCase().normalize('NFD').replace(/\p{Diacritic}/gu, '').replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -53,18 +55,45 @@ function cursoMencionado(texto) {
 }
 
 function intencion(texto) {
+  const aula = /\b(?:aula|plataforma|panel|temario|portal|curso|cursos|clase grabada|mi gallo ia)\b/.test(texto);
+  const enCuenta = aula || /\b(?:mi cuenta|mi perfil|mi usuario|iniciar sesion|inicie sesion|login|entre con google|soporte)\b/.test(texto);
   if (/\b(antibiotic\w*|medicament\w*|dosific\w*|dosis|diagnostic\w*|sintomas?)\b|mis? (aves|gallinas|pollos?) (esta|estan|tiene|tienen) (enferm\w+|diarrea)|se me (murio|mueren)/.test(texto)) return 'veterinaria';
-  if (/\b([cs]ertif\w*|constancia|diploma|reconocimiento|folio|ipcil)\b/.test(texto)) return 'certificado';
-  if (/\b(regalo|bono|bonus)\b/.test(texto) || /\bsexaje\b/.test(texto) && /\b(no aparece|gratis|acced\w*|acceso|recibo)\b/.test(texto)) return 'regalo';
+  const documentoCurso = /\b(?:[cs]ertif\w*|constancia|diploma|reconocimiento|folio|ipcil)\b/.test(texto);
+  const documentoSanitario = /\b(?:zoosanitari\w*|fitosanitari\w*|certific\w* sanitari\w*|constancia de vacunacion)\b/.test(texto);
+  if (documentoCurso && (aula || !documentoSanitario && /\b(?:mi|folio|ipcil|solicit\w*|descarg\w*|donde|como saco)\b|^(?:[cs]ertif\w*|constancia|diploma)$/.test(texto))) return 'certificado';
+  if (/\b(regalo|bono|bonus)\b/.test(texto) && (aula || /\b(?:mi|no aparece|sexaje|incluido)\b|^(?:regalo|bono|bonus)$/.test(texto)) || /\bsexaje\b/.test(texto) && /\b(no aparece|gratis|acced\w*|acceso|recibo)\b/.test(texto)) return 'regalo';
   if (/\b(olvide|olvido|perdi|restablec\w*|cambi\w*|recuper\w*)\b.*\b(contrasen\w*|clave)\b|\b(contrasen\w*|clave)\b.*\b(olvide|olvido|perdi|restablec\w*)\b/.test(texto)) return 'contrasena';
   if (/\b(no (?:(?:me|se) )?(?:carga|abre|ve|reprodu[cs]\w*)|no puedo (?:ver|abrir)|se (?:traba|detiene|queda)|pantalla (?:negra|en blanco)|error)\b/.test(texto) && /\b(video\w*|bideo\w*|clase\w*|grabacion\w*|reproductor)\b/.test(texto)) return 'video';
-  if (/\b(pague|pago|pagos|cobr\w*|stripe|oxxo|tarjeta|factura\w*|reembolso|devolucion|comprobante|doble cargo)\b/.test(texto)) return 'pago';
-  if (/cuanto (cuesta|sale|vale)|cual es (el )?precio|\b(descuent\w*|promosion|promocion|precio del curso|inscrib\w*|comprar)\b|^precio$/.test(texto)) return 'precio';
-  if (/\b(material\w*|descarg\w*|pre[cs]enta[cs]ion\w*|pptx?|pdf|excel|archiv\w*|recetario|manual|diapo\w*)\b/.test(texto) && !/sexaje manual|metodo manual/.test(texto)) return 'materiales';
-  if (/\b(no (puedo|me deja|logro) entrar|no me aparece|iniciar sesion|acced\w*|acceso|correo|cuenta|ingres\w*|login)\b/.test(texto)) return 'acceso';
-  if (/\b(avance|progreso|retomar|continuar|marcar (como )?vista)\b/.test(texto)) return 'progreso';
-  if (/\b(ayuda humana|soporte|whats\s?app|wats\s?ap|contact\w*|hablar con (una persona|alguien))\b/.test(texto)) return 'soporte';
-  if (/\b(temario|de que trata|que incluye|que (voy a )?aprend\w*|que ensen\w*|cuantos? (?:temas?|modulos?)|cuantas? (?:clases?|sesiones?)|quien (imparte|da)|ponent\w*|instructor\w*)\b/.test(texto)) return 'temario';
+  const pago = /\b(?:pague|page|pago|pagos|pagar|cobr\w*|tarjeta|factur\w*|reembolso|devolucion|comprobante)\b/.test(texto);
+  const accesoAlComprar = /\b(?:ya pague|ya page|ya hice el pago|ya compre)\b.*\b(?:entr\w*|correo|aparece|clases)\b/.test(texto);
+  if (/\b(?:stripe|oxxo|checkout|doble cargo)\b|^(?:ya )?(?:pague|page|pago|pagos|reembolso)$/.test(texto) || pago && enCuenta || accesoAlComprar) return 'pago';
+  const precio = /cuanto (?:cuesta|sale|vale)|cual es (?:el )?precio|\b(?:precio|descuent\w*|promosion|promocion|comprar|compr[oa]|inscrib\w*)\b/.test(texto);
+  const oferta = /\b(?:descuent\w*|promosion|promocion)\b/.test(texto)
+    && /\b(?:gallinas de postura|embutidos artesanales|embutidos|curso regalo|sexaje avicola)\b/.test(texto);
+  const costoProductivo = /\b(?:producir|alimentar|criar|fabricar|mantener|engordar|por kilo|por huevo|por animal)\b/.test(texto);
+  const precioDelCurso = /\b(?:precio|costo|valor) (?:del|de mi|de este) curso\b|\bcuanto (?:cuesta|sale|vale) (?:el|mi|este|ese|un) curso\b/.test(texto);
+  if (/^(?:precio|inscripcion|promocion|descuento|(?:me )?quiero inscribirme)$/.test(texto)
+      || precioDelCurso || precio && (oferta || aula && !costoProductivo)) return 'precio';
+  const nombreArchivo = /\b(?:pre[cs]enta[cs]ion\w*|pptx?|pdf|excel|archiv\w*|recetario|manual|diapo\w*)\b/.test(texto);
+  const operacionArchivo = /\b(?:donde|abr\w*|ver|veo|descarg\w*|baj\w*|guard\w*)\b/.test(texto);
+  const materialesCurso = /\b(?:material(?:es)?|recursos)\s+(?:del|de mi|de la)\s+(?:curso|clase|aula)\b/.test(texto);
+  const materialManejo = /\b(?:material(?:es)? (?:de|para) (?:la |el )?(?:cama|nidos?|sustrato|piso|corrales?)|sexaje manual|metodo manual)\b/.test(texto);
+  const archivoAula = nombreArchivo && (aula || operacionArchivo) && !/sexaje manual|metodo manual/.test(texto);
+  const abreRecursos = /\b(?:donde (?:estan|veo|encuentro)|como (?:veo|abro|descargo)) (?:mis |los )?materiales\b/.test(texto);
+  const recursosAula = aula && /\b(?:material(?:es)?|recursos|descarg\w*)\b/.test(texto);
+  if (/^(?:materiales|descargas|recetario|pdf|pptx?)$/.test(texto) || materialesCurso || archivoAula
+      || !materialManejo && (abreRecursos || recursosAula)) return 'materiales';
+  const entrada = /\b(?:no (?:puedo|me deja|logro) entrar|iniciar sesion|olvide el correo de compra|con (?:que|cual) correo (?:entro|ingreso)|login)\b/.test(texto);
+  const accesoAula = /\b(?:acceso|acced\w*|entr\w*|ingres\w*) (?:al|a la|a mi|en mi|en la) (?:curso|aula|cuenta|plataforma|panel)\b/.test(texto);
+  if (entrada || accesoAula || /^(?:mi )?(?:cuenta|correo|acceso)$/.test(texto)
+      || enCuenta && /\b(?:no me aparece|correo|mi cuenta|mi usuario)\b/.test(texto)) return 'acceso';
+  if (/^mi (?:avance|progreso)$|^marcar como vista$/.test(texto)
+      || (aula || /\b(?:mi clase|ultima clase|leccion)\b/.test(texto)) && /\b(?:avance|progreso|retomar|continuar|marcar (?:como )?vista)\b/.test(texto)) return 'progreso';
+  if (/\b(?:ayuda humana|soporte|whats\s?app|wats\s?ap|hablar con (?:una persona|alguien))\b/.test(texto)
+      || enCuenta && /\bcontact\w*\b/.test(texto)) return 'soporte';
+  if (/\b(?:temario|ponent\w*|instructor\w*|quien imparte|cuantas? (?:clases?|sesiones?))\b/.test(texto)
+      || /\bquien da\b/.test(texto) && cursoMencionado(texto)
+      || aula && /\b(?:de que trata|que incluye|que (?:voy a )?aprend\w*|que ensen\w*|cuantos? (?:temas?|modulos?)|quien da)\b/.test(texto)) return 'temario';
   if (/\b(donde (estan|veo|puedo ver|encuentro)|como (veo|empiezo|inicio)|ver (las?|mis)|abrir (las?|mis))\b.*\b(clases?|videos?|grabaciones?)\b/.test(texto)) return 'clases';
   return null;
 }
@@ -92,6 +121,10 @@ function cursoDePregunta(actual, texto, anteriores) {
 }
 
 function buscarClases(texto) {
+  const aula = /\b(?:aula|curso|temario|leccion|videos?|grabaciones?)\b/.test(texto);
+  // “Clase de cama” habla de una categoría de manejo, no de grabaciones del aula.
+  const categoriaFisica = /\b(?:que|cual) clase de (?:alimento|cama|suelo|bebedero|luz|comederos?|piso|forraje|agua|material)\b|\bmodulos? de (?:sombra|luz|cria|cama|riego)\b/.test(texto);
+  if (!aula && categoriaFisica) return null;
   const numeros = { uno: 1, primer: 1, primera: 1, primero: 1, dos: 2, segunda: 2, segundo: 2, tres: 3, tercera: 3, tercero: 3, cuatro: 4, cuarta: 4, cuarto: 4, cinco: 5, quinta: 5, quinto: 5, seis: 6, sexta: 6, sexto: 6 };
   const extraer = /\b(?:clase|sesion|modulo|video|grabacion) (?:numero )?(\d{1,2}|uno|dos|tres|cuatro|cinco|seis)\b|\b(primer[ao]?|segund[ao]|tercer[ao]|cuart[ao]|quint[ao]|sext[ao]) (?:clase|sesion|modulo|video|grabacion)\b/;
   const match = texto.match(extraer);
@@ -157,6 +190,8 @@ function armarRespuesta(cursoActual, mensaje, historial, ficha) {
   const anteriores = historialUsuario(historial);
   const slug = cursoDePregunta(cursoActual, texto, anteriores);
   const curso = CURSOS[slug];
+  const orientacion = orientacionBase(texto, slug, anteriores);
+  if (orientacion) return orientacion;
   let tema = intencion(texto);
   let unidad = unidadMencionada(texto, curso);
   const seguimiento = /^(y |entonces |tambien |donde\b|como\b|cuanto\b|en que\b|que hago\b)/.test(texto) && texto.split(' ').length <= 12;
@@ -196,8 +231,9 @@ function armarRespuesta(cursoActual, mensaje, historial, ficha) {
     return { texto: `El temario de ${curso.nombre} incluye ${nombre}. ${unidad.texto}\n¿Quieres consultar las clases del aula o revisar otro tema?`, reformular: true };
   }
 
-  if (/^(hola|buenos dias|buenas tardes|buenas noches|buenas|que tal|hey)$/.test(texto)) {
-    return { texto: `¡Hola! Desde aquí puedes preguntarme sobre ${curso.nombre}, Embutidos, Gallinas, Sexaje Avícola o cómo usar el aula. ¿Qué te gustaría revisar?`, reformular: false };
+  if (SALUDO.test(texto)) {
+    return { texto: '¡Hola! Soy tu Gallo IA. Puedo orientarte sobre salud y manejo de animales, ayudarte a repasar ' +
+      curso.nombre + ' o ubicar tus clases y materiales. ¿Qué te gustaría revisar?', reformular: false };
   }
   if (/^(muchas )?gracias( .*)?$/.test(texto)) {
     return { texto: '¡De nada! Si quieres, seguimos con otra clase o con una duda sobre el aula.', reformular: false };
@@ -284,7 +320,7 @@ function registrarGalloIA(app, { db, tokenRequerido, accesoA, leerCurso, normali
       const destino = cursoDePregunta(cursoSlug, texto, historialUsuario(recientes));
       const tema = intencion(texto);
       const pideDatosAula = buscarClases(texto) || tema === 'temario' && /quien|ponent|instructor/.test(texto);
-      const consultaAula = pideDatosAula || TEMAS_AULA.has(tema);
+      const consultaAula = pideDatosAula || TEMAS_AULA.has(tema) || pideVigencia(texto);
       const requierePermisoDestino = pideDatosAula || (usarModelo === true && !consultaAula);
       const permiso = destino === cursoSlug ? acceso : requierePermisoDestino ? await accesoA(usuario, destino) : null;
       const destinoPermitido = Boolean(permiso && permiso.revocado !== true);
@@ -301,9 +337,9 @@ function registrarGalloIA(app, { db, tokenRequerido, accesoA, leerCurso, normali
         cursoSlug: destinoPermitido ? destino : cursoSlug,
         mensaje,
         historial: recientes,
-        usarModelo: usarModelo === true && !consultaAula,
+        usarModelo: usarModelo === true && !consultaAula && !SALUDO.test(texto),
         senal: abortar.signal
-      }) || { respuesta: guia.texto, modo: 'guia', fuentes: [], sinEvidencia: guia.sinEvidencia === true };
+      }) || { respuesta: guia.texto, modo: 'guia', fuentes: guia.fuentes || [], sinEvidencia: guia.sinEvidencia === true };
       if (abortar.signal.aborted) return;
 
       const final = { respuesta: resultado.respuesta, modo: resultado.modo, fuentes: resultado.fuentes, version: VERSION_MOTOR, turnoId: null };

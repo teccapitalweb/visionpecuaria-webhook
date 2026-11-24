@@ -140,15 +140,41 @@ test('no se reenvía salida clínica, de riesgo biológico o con enlaces inventa
   }
   const seguimiento = await seguro({
     cursoSlug, mensaje: 'Son 30 pollos de 4 semanas. Desde ayer.',
-    historial: [{ rol: 'usuario', texto: 'A mis pollos les dio diarrea, qué hago' }], usarModelo: true
+    historial: [{ rol: 'usuario', texto: 'Mis pollos respiran con el pico abierto y uno no se levanta.' }], usarModelo: true
   });
-  assert.match(seguimiento.respuesta, /médico veterinario/);
+  assert.match(seguimiento.respuesta, /atención veterinaria cuanto antes/);
   assert.doesNotMatch(seguimiento.respuesta, /Qué especie|Qué edad|Desde cuándo/);
 
-  for (const salida of ['Usa la fuente https://ejemplo.org/supuesta', 'Suspende el tratamiento y cambia la dosis del medicamento.']) {
+  for (const salida of ['Usa la fuente https://ejemplo.org/supuesta', 'Suspende el tratamiento y cambia la dosis del medicamento.',
+    'Para tu gallina son 5 mg por kg.', 'Aísla y cultiva la bacteria.']) {
     const motor = crearMotorGallo({ db: new FakeDB(), env, log, fetchModelo: async () => respuestaProveedor(salida) });
     assert.equal(await motor({ cursoSlug, mensaje: 'cómo voy a organizar mis lotes', usarModelo: true }), null);
   }
+});
+
+test('consultas educativas de sanidad y síntomas estables admiten contexto y citas', async () => {
+  const extracto = 'Registra cuándo aparecieron las lesiones y cuántas aves presentan signos.';
+  const llamadas = [];
+  const motor = crearMotorGallo({
+    db: new FakeDB(), env, log,
+    recuperar: async () => [{ id: 'ficha', titulo: 'Registro de signos', texto: extracto }],
+    fetchModelo: async (url, req) => {
+      llamadas.push(JSON.parse(JSON.parse(req.body).input));
+      return respuestaProveedor('La bioseguridad y los registros ayudan a orientar la revisión [F1]. Evita dar medicamentos por tu cuenta.',
+        [{ referencia: 'F1', extracto }]);
+    }
+  });
+  for (const mensaje of ['q es avicultura', 'que es mortalidad acumulada', 'como cuido la sanidad de mis gallinas',
+    'Que pasa si a mis pollitos les sale granos blancos']) {
+    const respuesta = await motor({ cursoSlug, mensaje, usarModelo: true });
+    assert.equal(respuesta.modo, 'ia', mensaje);
+    assert.equal(respuesta.fuentes[0].id, 'ficha');
+  }
+  const siguiente = await motor({ cursoSlug, mensaje: 'de 12 semanas', usarModelo: true,
+    historial: [{ rol: 'usuario', texto: 'a mis pollitos les salieron granitos blancos' }] });
+  assert.equal(siguiente.modo, 'ia');
+  assert.equal(llamadas.at(-1).tipoConsulta, 'sanidad-y-manejo');
+  assert.match(llamadas.at(-1).conversacion[0].texto, /granitos blancos/);
 });
 
 test('el mecanismo de admisión usa la misma cuota transaccional para consultas simultáneas', async () => {
