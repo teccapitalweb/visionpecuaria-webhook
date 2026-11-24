@@ -10,7 +10,10 @@
   "dependencies": {
     "express": "^4.18.2",
     "firebase-admin": "^12.0.0",
-    "stripe": "^14.25.0"
+    "pdfjs-dist": "4.8.69",
+    "saxes": "6.0.0",
+    "stripe": "^14.25.0",
+    "yauzl": "3.4.0"
   },
   "engines": {
     "node": ">=18"

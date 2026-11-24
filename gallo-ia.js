@@ -1,3 +1,6 @@
+const { setTimeout: esperarFragmento } = require('node:timers/promises');
+const { crearMotorGallo, limpiarHistorial, VERSION_MOTOR } = require('./gallo-motor');
+
 const CURSOS = {
   'gallinas-de-postura': {
     nombre: 'Manejo Profesional de Gallinas de Postura',
@@ -200,38 +203,9 @@ function armarRespuesta(cursoActual, mensaje, historial, ficha) {
     return { texto: '¡De nada! Si quieres, seguimos con otra clase o con una duda sobre el aula.', reformular: false };
   }
   if (cursoMencionado(texto)) {
-    return { texto: `Puedo orientarte sobre ${curso.nombre}. ¿Buscas su temario, una clase específica o ayuda para entrar a sus materiales?`, reformular: false };
+    return { texto: `Puedo orientarte sobre ${curso.nombre}. ¿Buscas su temario, una clase específica o ayuda para entrar a sus materiales?`, reformular: false, sinEvidencia: true };
   }
-  return { texto: 'Cuéntame un poco más para poder ubicar tu duda. Puedo ayudarte a encontrar una clase, ver o descargar un material, pedir tu certificado o resolver dudas de acceso y pago. ¿Qué estabas intentando hacer?', reformular: false };
-}
-
-async function reformularConGemini(texto) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  const modelo = process.env.GALLO_GEMINI_MODEL || '';
-  if (!apiKey || !/^gemini-[a-z0-9.-]+$/.test(modelo)) return null;
-  try {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-      signal: AbortSignal.timeout(4500),
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: 'Eres Mi Gallo IA en el aula de Visión Pecuaria. Redacta en español mexicano, en texto plano y con claridad. Reformula únicamente la información que se te da. Conserva el curso y los hechos. No agregues instrucciones médicas o alimentarias, precios, fechas, datos personales ni enlaces.' }] },
-        // Sólo se comparten fichas aprobadas, sin mensaje del alumno, historial ni identidad.
-        contents: [{ parts: [{ text: texto }] }],
-        generationConfig: { maxOutputTokens: 220, temperature: 0.15 }
-      })
-    });
-    if (!r.ok) return null;
-    const datos = await r.json();
-    const candidato = datos.candidates?.[0];
-    if (candidato?.finishReason !== 'STOP') return null;
-    const salida = candidato.content?.parts?.filter(parte => !parte.thought).map(parte => parte.text || '').join('').trim();
-    if (!salida || salida.length > 1000 || /https?:|www\.|\bmxn\b|[$@]|\b(dosis|antibiotico|diagnostic)\w*/i.test(salida)) return null;
-    const originales = new Set(texto.match(/\d+/g) || []);
-    return (salida.match(/\d+/g) || []).every(numero => originales.has(numero)) ? salida : null;
-  } catch {
-    return null;
-  }
+  return { texto: 'Cuéntame un poco más para poder ubicar tu duda. Puedo ayudarte a encontrar una clase, ver o descargar un material, pedir tu certificado o resolver dudas de acceso y pago. ¿Qué estabas intentando hacer?', reformular: false, sinEvidencia: true };
 }
 
 function limitadorMensajes() {
@@ -253,14 +227,33 @@ function limitadorMensajes() {
   };
 }
 
-function registrarGalloIA(app, { tokenRequerido, accesoA, leerCurso, normalizarClases, log = console }) {
+const TEMAS_AULA = new Set(['certificado', 'regalo', 'contrasena', 'video', 'pago', 'precio', 'materiales', 'acceso', 'progreso', 'soporte', 'clases', 'temario']);
+
+function iniciarFlujo(res) {
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'private, no-store, no-transform');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+  res.write(': preparando\n\n');
+}
+
+function evento(res, tipo, datos) {
+  if (!res.writableEnded && !res.destroyed) res.write(`event: ${tipo}\ndata: ${JSON.stringify(datos)}\n\n`);
+}
+
+function registrarGalloIA(app, { db, tokenRequerido, accesoA, leerCurso, normalizarClases, memoria, recuperar, log = console }) {
   const esperar = limitadorMensajes();
+  const motor = crearMotorGallo({ db, recuperar, log });
   app.post('/alumno/gallo-ia', async (req, res) => {
     res.setHeader('Cache-Control', 'private, no-store');
+    const flujo = /(?:^|[,\s])text\/event-stream(?:[,;\s]|$)/i.test(req.get('accept') || '');
+    const abortar = new AbortController();
+    const alCerrar = () => abortar.abort();
+    res.once('close', alCerrar);
     try {
       const usuario = await tokenRequerido(req, res);
       if (!usuario) return;
-      const { cursoSlug, mensaje, historial } = req.body || {};
+      const { cursoSlug, mensaje, historial, usarModelo } = req.body || {};
       if (typeof cursoSlug !== 'string' || !Object.hasOwn(CURSOS, cursoSlug)) {
         return res.status(400).json({ error: 'Elige un curso de Visión Pecuaria.' });
       }
@@ -274,10 +267,23 @@ function registrarGalloIA(app, { tokenRequerido, accesoA, leerCurso, normalizarC
       }
       const acceso = await accesoA(usuario, cursoSlug);
       if (!acceso || acceso.revocado === true) return res.status(403).json({ error: 'Sin acceso a este curso' });
+      if (abortar.signal.aborted) return;
+      if (flujo) iniciarFlujo(res);
+
+      let contexto = { generacion: null, mensajes: [] };
+      if (memoria) {
+        try {
+          contexto = await memoria.leerContexto(usuario.uid, cursoSlug);
+        } catch (e) {
+          log.warn('Mi Gallo IA: memoria no disponible', e.code || e.name);
+        }
+      }
+      const recientes = limpiarHistorial(contexto.mensajes?.length ? contexto.mensajes : historial);
 
       const texto = normalizar(mensaje);
-      const destino = cursoDePregunta(cursoSlug, texto, historialUsuario(historial));
-      const pideDatosAula = buscarClases(texto) || intencion(texto) === 'temario' && /quien|ponent|instructor/.test(texto);
+      const destino = cursoDePregunta(cursoSlug, texto, historialUsuario(recientes));
+      const tema = intencion(texto);
+      const pideDatosAula = buscarClases(texto) || tema === 'temario' && /quien|ponent|instructor/.test(texto);
       let ficha = null;
       if (pideDatosAula) {
         const permiso = destino === cursoSlug ? acceso : await accesoA(usuario, destino);
@@ -289,12 +295,53 @@ function registrarGalloIA(app, { tokenRequerido, accesoA, leerCurso, normalizarC
           }
         }
       }
-      const guia = armarRespuesta(cursoSlug, mensaje, historial, ficha);
-      const ia = guia.reformular ? await reformularConGemini(guia.texto) : null;
-      return res.json({ respuesta: ia || guia.texto, modo: ia ? 'ia' : 'guia' });
+      const guia = armarRespuesta(cursoSlug, mensaje, recientes, ficha);
+      const consultaAula = pideDatosAula || TEMAS_AULA.has(tema);
+      const resultado = await motor({
+        cursoSlug: destino,
+        mensaje,
+        historial: recientes,
+        usarModelo: usarModelo === true && !consultaAula,
+        senal: abortar.signal
+      }) || { respuesta: guia.texto, modo: 'guia', fuentes: [], sinEvidencia: guia.sinEvidencia === true };
+      if (abortar.signal.aborted) return;
+
+      const final = { respuesta: resultado.respuesta, modo: resultado.modo, fuentes: resultado.fuentes, version: VERSION_MOTOR, turnoId: null };
+      if (flujo) {
+        // Validar y fundamentar el texto completo antes de mostrarlo, evitando emitir texto inseguro.
+        for (const texto of final.respuesta.match(/[\s\S]{1,140}/gu) || []) {
+          if (abortar.signal.aborted) return;
+          evento(res, 'delta', { texto });
+          await esperarFragmento(12, undefined, { signal: abortar.signal });
+        }
+      }
+      if (memoria) {
+        try {
+          final.turnoId = await memoria.guardarTurno(usuario.uid, cursoSlug, contexto.generacion, {
+            mensaje,
+            respuesta: final.respuesta,
+            fuentes: resultado.fuentes,
+            version: final.version,
+            modo: final.modo,
+            sinEvidencia: resultado.sinEvidencia
+          });
+        } catch (e) {
+          log.warn('Mi Gallo IA: recibo no disponible', e.code || e.name);
+        }
+      }
+      if (abortar.signal.aborted) return;
+      if (!flujo) return res.json(final);
+      evento(res, 'final', final);
+      res.end();
     } catch (e) {
       log.error('Mi Gallo IA: no se pudo preparar una respuesta.', e.code || e.name);
-      return res.status(500).json({ error: 'No pudimos responder en este momento. Inténtalo de nuevo.' });
+      if (abortar.signal.aborted) return;
+      const datos = { error: 'No pudimos responder en este momento. Inténtalo de nuevo.' };
+      if (!res.headersSent) return res.status(500).json(datos);
+      evento(res, 'error', datos);
+      res.end();
+    } finally {
+      res.removeListener('close', alCerrar);
     }
   });
 }

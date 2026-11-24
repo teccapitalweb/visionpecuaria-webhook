@@ -21,6 +21,10 @@ const crypto = require('crypto');
 const { regaloVigente, aplicarRegalo } = require('./regalos');
 const { registrarMetricasPromocion } = require('./promocion-analytics');
 const { registrarGalloIA } = require('./gallo-ia');
+const { configurarMotor, diaEnMexico } = require('./gallo-motor');
+const { crearMemoriaGallo, registrarMemoriaGallo } = require('./gallo-memoria');
+const { registrarConocimientoGallo, buscarConocimientoGallo } = require('./gallo-conocimiento');
+const { registrarEvaluacionesGallo } = require('./gallo-evaluacion');
 
 const BUCKET_DEFAULT = 'visionpecuaria-vip.firebasestorage.app';
 const URL_FIRMADA_MS = 2 * 60 * 60 * 1000; // 2 h
@@ -190,7 +194,22 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
   }
 
   registrarMetricasPromocion(app, { db, tokenRequerido, adminRequerido, log });
-  registrarGalloIA(app, { tokenRequerido, accesoA, leerCurso, normalizarClases, log });
+  const memoriaGallo = crearMemoriaGallo(db, { retencionHabilitada: process.env.GALLO_RETENCION_CONFIGURADA === 'true' });
+  const modeloDisponible = () => Boolean(configurarMotor(process.env));
+  const leerConsumo = async () => {
+    const id = 'visionpecuaria_' + diaEnMexico(new Date());
+    const dato = (await db.collection('galloIAConsumoDiario').doc(id).get()).data();
+    if (!dato || dato.organizacion !== 'visionpecuaria') return null;
+    const permitidos = ['dia', 'limiteMicroUSD', 'maxSolicitudes', 'solicitudes', 'costoEstimadoMicroUSD',
+      'tokensEntrada', 'tokensSalida', 'aviso80En', 'avisoLimiteEn'];
+    return Object.fromEntries(permitidos.filter(campo => dato[campo] !== undefined).map(campo => [campo, dato[campo]]));
+  };
+  registrarGalloIA(app, { db, tokenRequerido, accesoA, leerCurso, normalizarClases, log,
+    memoria: memoriaGallo, recuperar: ({ consulta, ...opciones }) => buscarConocimientoGallo(db, { pregunta: consulta, ...opciones }) });
+  registrarMemoriaGallo(app, { memoria: memoriaGallo, tokenRequerido, accesoA, adminRequerido,
+    modeloDisponible, leerConsumo, log });
+  registrarConocimientoGallo(app, { db, adminRequerido, log });
+  registrarEvaluacionesGallo(app, { adminRequerido, log });
 
   async function auditar(adminUser, accion, datos) {
     await db.collection('auditoriaCursos').add({
