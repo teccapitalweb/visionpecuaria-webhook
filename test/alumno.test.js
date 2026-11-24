@@ -73,7 +73,7 @@ async function semilla() {
       { orden: 3, titulo: 'Módulo 3 · Sanidad', duracionMin: 70, estado: 'pendiente' }
     ],
     recursosDescargables: [{ titulo: 'Manual de Manejo Avícola', tipo: 'pdf', url: 'https://drive.google.com/uc?export=download&id=MAN1' }],
-    cupoLanzamientoTomados: 0
+    cupoLanzamientoTomados: 0, precioNormalCentavos: 105000, precioLanzamientoCentavos: 55000
   });
   s('cursosVenta/embutidos-artesanales', {
     nombre: 'Embutidos artesanales y chorizos',
@@ -85,7 +85,7 @@ async function semilla() {
   s(`accesosCurso/${sint('comprador@gmail.com')}/cursos/gallinas-de-postura`, { activo: true, slug: 'gallinas-de-postura' });
   // Embutidos con uid real (Google en checkout)
   s('accesosCurso/u-emb/cursos/embutidos-artesanales', { activo: true, slug: 'embutidos-artesanales', fechaCompra: '2026-08-01' });
-  s('comprasCurso/cs_emb', { slug: 'embutidos-artesanales', uid: 'u-emb', email: 'chef@gmail.com', estado: 'confirmado' });
+  s('comprasCurso/cs_emb', { slug: 'embutidos-artesanales', uid: 'u-emb', email: 'chef@gmail.com', estado: 'confirmado', montoPagadoCentavos: 55000 });
   // VIP sin compra
   s('miembros/u-vip', { estado: 'activo', plan: 'VIP Mensual' });
   // VIP con compra
@@ -99,7 +99,7 @@ async function semilla() {
   s('comprasCurso/cs_rev', { slug: 'gallinas-de-postura', email: 'rev@gmail.com', estado: 'confirmado', montoPagadoCentavos: 45000 });
   // Dos compras
   s('comprasCurso/cs_dos1', { slug: 'gallinas-de-postura', email: 'dos@gmail.com', estado: 'confirmado', montoPagadoCentavos: 45000 });
-  s('comprasCurso/cs_dos2', { slug: 'embutidos-artesanales', email: 'dos@gmail.com', estado: 'confirmado' });
+  s('comprasCurso/cs_dos2', { slug: 'embutidos-artesanales', email: 'dos@gmail.com', estado: 'confirmado', montoPagadoCentavos: 55000 });
   // Pago OXXO que ya se acreditó en Stripe pero el webhook no llegó
   s('comprasCurso/cs_pend', { sessionId: 'cs_pend', slug: 'gallinas-de-postura', email: 'oxxo@gmail.com', estado: 'pendiente' });
 }
@@ -461,9 +461,8 @@ test('actividad pública enlaza Stripe a la visita, anonimiza y deduplica tiempo
   assert.ok(!JSON.stringify(respuesta.data).includes(visitaId));
 });
 
-test('se atribuye la oferta inversa sin descuento y la lista de compras sólo es visible al admin', async () => {
+test('la atribución inversa sin solicitar descuento conserva el precio vigente, con compras privadas', async () => {
   const destinoSlug = 'gallinas-de-postura', origenSlug = 'embutidos-artesanales';
-  db._get('cursosVenta/' + destinoSlug).precioNormalCentavos = 55000;
   const visitaId = crypto.randomUUID();
   const pago = await api('/crear-checkout-curso', {
     method: 'POST', body: { slug: destinoSlug, visitaId, atribucionOrigen: origenSlug }
@@ -484,6 +483,45 @@ test('se atribuye la oferta inversa sin descuento y la lista de compras sólo es
   const resumen = await api(`/admin/cursos/promociones/metricas?origenSlug=${origenSlug}&destinoSlug=${destinoSlug}`, { token: 'tAdmin' });
   assert.equal(resumen.data.totales.checkout_creado.eventos, 1);
   assert.equal(resumen.data.totales.checkout_montado.eventos, 1);
+});
+
+test('el comprador de Embutidos obtiene $100 MXN para Gallinas, fijados por Stripe sin duplicar atribución', async () => {
+  const origenSlug = 'embutidos-artesanales', destinoSlug = 'gallinas-de-postura';
+  const query = '?origenSlug=' + origenSlug + '&destinoSlug=' + destinoSlug;
+  const cotizacion = '/alumno/promociones/cotizacion' + query;
+  const metricas = '/admin/cursos/promociones/metricas' + query;
+  const antes = (await api(metricas, { token: 'tAdmin' })).data.totales.checkout_creado.eventos;
+  const oferta = await api(cotizacion, { token: 'tEmbutidos' });
+  assert.equal(oferta.status, 200);
+  assert.equal(oferta.data.precioBaseCentavos, 55000);
+  assert.equal(oferta.data.descuentoCentavos, 10000);
+  assert.equal(oferta.data.montoCentavos, 45000);
+  assert.equal(oferta.data.moneda, 'mxn');
+  assert.match(oferta.data.origenNombre, /Embutidos/);
+  assert.match(oferta.data.destinoNombre, /gallinas/i);
+  assert.equal((await api(cotizacion, { token: 'tVipCompra' })).status, 403);
+  const previo = await api(cotizacion, { token: 'tDos' });
+  assert.equal(previo.status, 409);
+  assert.equal(previo.data.codigo, 'curso_adquirido');
+
+  const pago = await api('/crear-checkout-curso', {
+    method: 'POST', token: 'tEmbutidos',
+    body: { origenSlug, slug: destinoSlug, visitaId: crypto.randomUUID(), uid: 'otro', email: 'otro@example.org', montoCentavos: 1 }
+  });
+  assert.equal(pago.status, 200);
+  assert.deepEqual(pago.data.oferta, oferta.data);
+  const cliente = stripeMock.clientesCreados.at(-1);
+  const stripe = stripeMock.checkoutCreados.at(-1);
+  assert.equal(cliente.email, users.tEmbutidos.email);
+  assert.equal(stripe.metadata.uid, users.tEmbutidos.uid);
+  assert.equal(stripe.metadata.promoOrigenSlug, origenSlug);
+  assert.equal(stripe.metadata.promoDescuentoCentavos, '10000');
+  assert.equal(stripe.line_items[0].price_data.unit_amount, 45000);
+  assert.equal(stripe.allow_promotion_codes, false);
+
+  const despues = (await api(metricas, { token: 'tAdmin' })).data;
+  assert.equal(despues.totales.checkout_creado.eventos, antes + 1);
+  assert.equal(despues.ofertas.filter(p => p.origenSlug === origenSlug && p.destinoSlug === destinoSlug).length, 1);
 });
 
 test('visitas y dispositivos comparan cursos sin duplicar recargas del mismo evento', async () => {

@@ -11,10 +11,7 @@ const DURACIONES = {
 const PUBLICOS = ['pagina_visitada', 'enlace_abierto', 'video_reproducido', 'checkout_montado', 'ya_pague', ...Object.keys(DURACIONES)];
 const TIPOS = [...PUBLICOS, 'checkout_creado', 'compra_pagada'];
 const CURSOS_MEDIDOS = ['gallinas-de-postura', 'embutidos-artesanales'];
-const PROMOCIONES_MEDIDAS = [
-  ...OFERTAS_PROMOCIONALES,
-  { origenSlug: 'embutidos-artesanales', destinoSlug: 'gallinas-de-postura' }
-];
+const PROMOCIONES_MEDIDAS = OFERTAS_PROMOCIONALES;
 const SIN_ATRIBUCION = 'sin_atribucion';
 const DISPOSITIVOS = ['telefono', 'computadora', 'tableta', 'desconocido'];
 const MODOS_VIDEO = ['manual', 'automatico', 'desconocido'];

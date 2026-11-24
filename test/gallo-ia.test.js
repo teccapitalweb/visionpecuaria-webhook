@@ -23,7 +23,7 @@ test('Gallo orienta preguntas de soporte incluso con errores comunes de escritur
     ['¿Donde sale mi presentasion PDF?', /Abre|Entra a Materiales/],
     ['Ya pague y no me aparecen mis cursos', /mismo correo que usaste en Stripe/],
     ['¿Dónde sale mi curso de regalo?', /Mis cursos/],
-    ['Cuanto cuesta Embutidos con el descuento?', /total se confirman antes de pagar/]
+    ['Cuanto cuesta Embutidos con el descuento?', /tarjeta muestra el precio de alumno/]
   ];
   for (const [pregunta, resultado] of casos) assert.match(armarRespuesta(gallinas, pregunta, []).texto, resultado, pregunta);
 
@@ -77,6 +77,41 @@ test('Gallo limita la cantidad de mensajes por cuenta durante su ventana', () =>
   for (let i = 0; i < 12; i++) assert.equal(esperar('alumno-1'), 0);
   assert(esperar('alumno-1') > 0);
   assert.equal(esperar('alumno-2'), 0);
+});
+
+test('Gallo usa el número y la ubicación que ya indicó el alumno en el video', () => {
+  const alInicio = armarRespuesta(gallinas, 'Que tienen mis pollos', []);
+  assert.match(alInicio.texto, /apetito.*respiración/);
+  assert.doesNotMatch(alInicio.texto, /clases|certificado|pago/);
+
+  const primerasManchas = { rol: 'usuario', texto: 'Mis pollos tienen manchas blancas, me puedes ayudar?' };
+  const pico = { rol: 'usuario', texto: 'Porque les salen granos en los picos?' };
+  const enPico = armarRespuesta(gallinas, pico.texto, [primerasManchas]);
+  assert.match(enPico.texto, /costras por fuera del pico o placas dentro de la boca/);
+  assert.ok(enPico.fuentes.some(f => f.url.includes('vet.cornell.edu')));
+
+  const abdomen = 'Son pequeños, polluelos. Los afectados son 6 en la parvada y les salieron en el abdomen';
+  const orientacion = armarRespuesta(gallinas, abdomen, [primerasManchas, pico]);
+  assert.match(orientacion.texto, /6 afectados.*abdomen/);
+  assert.match(orientacion.texto, /ombligo/);
+  assert.match(orientacion.texto, /mismas aves/);
+  assert.doesNotMatch(orientacion.texto, /Cuántos están afectados|parte del cuerpo aparecieron|temario/);
+
+  const datos = { rol: 'usuario', texto: 'Tienen 4 días, son 6 aves afectadas de un total de 20. Las manchas están en el abdomen.' };
+  const urgencia = armarRespuesta(gallinas, 'Ahora no comen y murieron dos', [primerasManchas, datos]);
+  assert.match(urgencia.texto, /^Contacta cuanto antes a un médico veterinario/);
+  assert.match(urgencia.texto, /4 días.*6 afectados de 20/);
+  assert.ok(urgencia.fuentes.some(f => f.url.includes('gob.mx/senasica')));
+  assert.match(armarRespuesta(gallinas, 'Mis pollos no pueden respirar', []).texto, /^Contacta cuanto antes/);
+  assert.doesNotMatch(armarRespuesta(gallinas, 'Mis pollos tienen manchas y no respiran con el pico abierto', []).texto, /^Contacta cuanto antes/);
+});
+
+test('Gallo separa sugerencias técnicas de las rutas del aula', () => {
+  const consulta = armarRespuesta(gallinas, 'que material pongo en la cama de mis poyitos', []);
+  assert.match(consulta.texto, /cama/i);
+  assert.doesNotMatch(consulta.texto, /Entra a Materiales|temario/);
+  assert.ok(consulta.fuentes.some(f => typeof f.url === 'string' && f.url.startsWith('https:')));
+  assert.match(armarRespuesta(gallinas, '¿Cómo descargo el manual de manejo de pollitos?', []).texto, /Entra a Materiales/);
 });
 
 test('Gallo da recomendaciones breves por baja postura o calor y prioriza el triaje por síntomas', () => {
