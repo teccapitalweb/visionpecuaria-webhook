@@ -83,7 +83,10 @@ function fakeAuth(users = {}) {
   // users: { token: { uid, email, email_verified } }
   return {
     users,
-    async verifyIdToken(t) { if (!users[t]) throw new Error('bad token'); return users[t]; },
+    async verifyIdToken(t, comprobarRevocacion) {
+      if (!users[t] || (comprobarRevocacion && users[t].tokenRevocado)) throw new Error('bad token');
+      return users[t];
+    },
     async getUserByEmail(email) {
       const u = Object.values(users).find(x => x.email === email);
       if (!u) { const e = new Error('no user'); e.code = 'auth/user-not-found'; throw e; }
@@ -116,7 +119,7 @@ function fakeStripe(sessions = {}) {
       },
       async create(datos) {
         checkoutCreados.push(datos);
-        return { id: 'cs_test_new', client_secret: 'secret' };
+        return { id: 'cs_test_new_' + checkoutCreados.length, client_secret: 'secret' };
       }
     } },
     webhooks: { constructEvent(body) { return JSON.parse(Buffer.isBuffer(body) ? body.toString() : body); } },

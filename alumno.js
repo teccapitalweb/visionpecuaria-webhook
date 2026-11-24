@@ -173,11 +173,11 @@ function membresiaVigente(datos) {
 
 function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKET_DEFAULT, log = console, bunnyLlave = process.env.BUNNY_TOKEN_AUTH_KEY || process.env.BUNNY_TOKEN_KEY || '' }) {
 
-  async function tokenRequerido(req, res) {
+  async function tokenRequerido(req, res, comprobarRevocacion = false) {
     const h = req.get('authorization') || '';
     const token = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
     if (!token) { res.status(401).json({ error: 'Sesión requerida' }); return null; }
-    try { return await auth.verifyIdToken(token); }
+    try { return await auth.verifyIdToken(token, comprobarRevocacion); }
     catch (e) { res.status(401).json({ error: 'Sesión inválida o vencida' }); return null; }
   }
 
@@ -189,7 +189,15 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
     return u;
   }
 
-  registrarMetricasPromocion(app, { db, tokenRequerido, adminRequerido, log });
+  async function adminMetricasRequerido(req, res) {
+    const u = await tokenRequerido(req, res, true);
+    if (!u) return null;
+    if (u.admin === true || (await db.collection('admins').doc(u.uid).get()).exists) return u;
+    res.status(403).json({ error: 'Solo administradores' });
+    return null;
+  }
+
+  registrarMetricasPromocion(app, { db, tokenRequerido, adminRequerido, adminMetricasRequerido, log });
   registrarGalloIA(app, { tokenRequerido, accesoA, leerCurso, normalizarClases, log });
 
   async function auditar(adminUser, accion, datos) {
@@ -860,8 +868,11 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
           email: c.email || '',
           nombre: c.nombre || '',
           fechaCompra: c.fechaCompra || null,
+          confirmadoEn: c.confirmadoEn || null,
           montoPagadoCentavos: Number.isFinite(c.montoPagadoCentavos) ? c.montoPagadoCentavos : null,
           moneda: c.moneda || 'mxn',
+          dispositivo: c.dispositivo || 'desconocido',
+          ...(c.promoOrigenSlug ? { promoOrigenSlug: c.promoOrigenSlug, promoDescuentoCentavos: c.promoDescuentoCentavos || null } : {}),
           acceso
         };
       }));
