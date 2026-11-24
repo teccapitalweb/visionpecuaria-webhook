@@ -3,7 +3,7 @@ const admin = require('firebase-admin');
 const Stripe = require('stripe');
 const { regaloVigente, aplicarRegalo } = require('./regalos');
 const { obtenerOfertaPromocional, precioVigenteCentavos } = require('./promociones-cursos');
-const { guardarEventoPromo } = require('./promocion-analytics');
+const { guardarEventoPromo, registrarCheckoutActividad, normalizarVisitaId, atribucionValida } = require('./promocion-analytics');
 
 const app = express();
 
@@ -433,7 +433,10 @@ app.get('/alumno/promociones/cotizacion', async (req, res) => {
 
 app.post('/crear-checkout-curso', async (req, res) => {
   try {
-    const { slug: slugRaw, uid: uidRaw, email: emailRaw, nombre: nombreRaw, whatsapp: whatsappRaw, origenSlug: origenRaw } = req.body || {};
+    const {
+      slug: slugRaw, uid: uidRaw, email: emailRaw, nombre: nombreRaw, whatsapp: whatsappRaw,
+      origenSlug: origenRaw, atribucionOrigen, visitaId: visitaRaw
+    } = req.body || {};
 
     const slug = sanearTexto(slugRaw);
     const origenSlug = sanearTexto(origenRaw);
@@ -444,6 +447,7 @@ app.post('/crear-checkout-curso', async (req, res) => {
 
     if (!slug) return res.status(400).json({ error: 'Slug del curso requerido' });
     let oferta;
+    let usuarioOferta;
     if (origenSlug) {
       res.setHeader('Cache-Control', 'private, no-store');
       const usuario = await autenticarSolicitud(req, res);
@@ -456,6 +460,7 @@ app.post('/crear-checkout-curso', async (req, res) => {
       uid = usuario.uid;
       email = usuario.email.toLowerCase().trim();
       nombre = sanearTexto(usuario.name);
+      usuarioOferta = usuario;
     }
     // email/nombre/whatsapp son opcionales: el checkout directo deja que Stripe
     // recoja correo, nombre y teléfono en su propio formulario (como Sinergia).
@@ -528,12 +533,22 @@ app.post('/crear-checkout-curso', async (req, res) => {
         : `${SITIO_URL}/curso-acceso.html?slug=${encodeURIComponent(slug)}&session_id={CHECKOUT_SESSION_ID}`
     });
 
-    if (oferta) {
-      try {
+    try {
+      const visitaId = normalizarVisitaId(visitaRaw);
+      const origenActividad = oferta ? origenSlug : (atribucionValida(atribucionOrigen, slug) ? atribucionOrigen : null);
+      if (visitaId && atribucionValida(origenActividad, slug)) {
+        const cabecera = req.get('authorization') || '';
+        const usuario = usuarioOferta || (cabecera.startsWith('Bearer ')
+          ? await auth.verifyIdToken(cabecera.slice(7).trim()).catch(() => null)
+          : null);
+        await registrarCheckoutActividad(db, {
+          origenSlug: origenActividad, destinoSlug: slug, visitaId, usuario, sessionId: session.id
+        });
+      } else if (oferta) {
         await guardarEventoPromo(db, { origenSlug, destinoSlug: slug, tipo: 'checkout_creado', eventoId: session.id, uid, email, nombre });
-      } catch (err) {
-        console.warn('No se pudo registrar el checkout promocional:', err.message);
       }
+    } catch (err) {
+      console.warn('No se pudo registrar el checkout del curso:', err.code || err.name);
     }
     console.log(`✅ Checkout de curso creado: ${slug} para ${email} (${montoCentavos / 100})`);
     res.json({

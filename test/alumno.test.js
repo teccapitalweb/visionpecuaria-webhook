@@ -125,6 +125,63 @@ test('sin sesión → 401', async () => {
   assert.equal((await api('/alumno/estado', { token: 'falso' })).status, 401);
 });
 
+test('Mi Gallo IA requiere sesión y acceso al curso desde el que se abre', async () => {
+  const chat = (token, mensaje = '¿Cómo veo los materiales?') => api('/alumno/gallo-ia', {
+    token,
+    method: 'POST',
+    body: { cursoSlug: 'gallinas-de-postura', mensaje }
+  });
+  assert.equal((await chat()).status, 401);
+  assert.equal((await chat('tOtro')).status, 403);
+  assert.equal((await chat('tRevocado')).status, 403);
+  assert.equal((await chat('tGallinas', ' '.repeat(1001))).status, 400);
+  const r = await chat('tGallinas');
+  assert.equal(r.status, 200);
+  assert.equal(r.data.modo, 'guia');
+  assert.match(r.data.respuesta, /Materiales dentro de tu curso/);
+});
+
+test('Mi Gallo IA usa títulos y conteos reales del aula solamente si se tiene acceso', async () => {
+  const privado = 'cursosContenidoPrivado/embutidos-artesanales';
+  const original = db._get(privado);
+  const titulo = 'Especias y el arte del adobo tradicional';
+  db.data.set(privado, { clases: [
+    { orden: 3, titulo: 'Material reservado de clase tres', storagePath: 'privado.mp4' },
+    { orden: 1, titulo, storagePath: 'privado.mp4' },
+    { orden: 2, titulo: 'Preparaciones del curso', storagePath: 'privado.mp4' },
+    { orden: 4, titulo: 'Manejo y conservación', storagePath: 'privado.mp4' },
+    { orden: 5, titulo: 'Cierre y revisión', estado: 'pendiente' }
+  ] });
+  const chat = (token, cursoSlug, mensaje) => api('/alumno/gallo-ia', {
+    token,
+    method: 'POST',
+    body: { cursoSlug, mensaje }
+  });
+  try {
+    const propio = await chat('tEmbutidos', 'embutidos-artesanales', '¿Cuál es la primera clase?');
+    assert.equal(propio.status, 200);
+    assert.match(propio.data.respuesta, new RegExp(`Clase 1 · ${titulo}`));
+    assert.doesNotMatch(propio.data.respuesta, /privado\.mp4/);
+    const contar = await chat('tEmbutidos', 'embutidos-artesanales', '¿Cuántas clases hay?');
+    assert.match(contar.data.respuesta, /5 clases.*4 grabaciones publicadas y 1 pendiente/);
+    const listar = await chat('tEmbutidos', 'embutidos-artesanales', '¿Qué clases hay?');
+    assert.match(listar.data.respuesta, /Clase 5 · Cierre y revisión \(grabación pendiente\)/);
+    assert.doesNotMatch(listar.data.respuesta, /Clase 6/);
+    const buscar = await chat('tEmbutidos', 'embutidos-artesanales', '¿En qué clase explican el adobo?');
+    assert.match(buscar.data.respuesta, new RegExp(titulo));
+
+    const conAcceso = await chat('tDos', 'gallinas-de-postura', '¿Cuál es la clase 1 de Embutidos?');
+    assert.match(conAcceso.data.respuesta, new RegExp(titulo));
+    const ajeno = await chat('tGallinas', 'gallinas-de-postura', '¿Qué clases tiene Embutidos?');
+    assert.equal(ajeno.status, 200);
+    assert.match(ajeno.data.respuesta, /temario público/);
+    assert.doesNotMatch(ajeno.data.respuesta, /arte del adobo|reservado|privado\.mp4/);
+  } finally {
+    if (original) db.data.set(privado, original);
+    else db.data.delete(privado);
+  }
+});
+
 test('compra histórica de Gallinas (uid sintético) se recupera con correo verificado', async () => {
   const r = await api('/alumno/estado', { token: 'tGallinas' });
   assert.equal(r.status, 200);
@@ -348,6 +405,83 @@ test('la promoción rechaza enlaces sin sesión, gratuitos, revocados o con dest
   });
   assert.equal(checkout.status, 403);
   assert.equal(stripeMock.checkoutCreados.length, n);
+});
+
+test('actividad pública enlaza Stripe a la visita, anonimiza y deduplica tiempos medidos', async () => {
+  const slug = 'embutidos-artesanales';
+  const visitaId = crypto.randomUUID();
+  const pago = await api('/crear-checkout-curso', {
+    method: 'POST', body: { slug, visitaId, uid: 'u-otro', email: 'atribuido-falso@example.org' }
+  });
+  assert.equal(pago.status, 200);
+  const enviar = (tipo, eventoId, extras = {}, token) => api('/publico/cursos/actividad', {
+    method: 'POST', token, body: { destinoSlug: slug, visitaId, tipo, eventoId, ...extras }
+  });
+  const sessionId = pago.data.sessionId;
+  assert.equal((await enviar('checkout_montado', sessionId, { visitaId: crypto.randomUUID() })).status, 404);
+  assert.equal((await enviar('checkout_montado', sessionId, { origenSlug: 'gallinas-de-postura' })).status, 404);
+  assert.equal((await enviar('checkout_tiempo', sessionId, { duracionSeg: 4 })).status, 404);
+  assert.equal((await enviar('checkout_montado', sessionId, { sessionId }, 'tGallinas')).status, 204);
+  assert.equal((await enviar('checkout_tiempo', sessionId, { duracionSeg: 4 })).status, 204);
+  assert.equal((await enviar('checkout_tiempo', sessionId, { duracionSeg: 2 })).status, 204);
+  assert.equal((await enviar('checkout_tiempo', sessionId, { duracionSeg: 4 })).status, 204);
+
+  const enlaceId = crypto.randomUUID();
+  assert.equal((await enviar('enlace_tiempo', enlaceId, { duracionSeg: 2 })).status, 404);
+  assert.equal((await enviar('enlace_abierto', enlaceId)).status, 204);
+  assert.equal((await enviar('enlace_tiempo', enlaceId, { duracionSeg: 3 })).status, 204);
+  assert.equal((await enviar('enlace_tiempo', enlaceId, { duracionSeg: 1 })).status, 204);
+
+  const videoId = crypto.randomUUID();
+  assert.equal((await enviar('video_reproducido', videoId, { modo: 'automatico', email: 'falso@example.org' }, 'tSinVerif')).status, 204);
+  assert.equal((await enviar('video_tiempo', videoId, { duracionSeg: 6 * 3600 + 1 })).status, 400);
+  assert.equal((await enviar('video_tiempo', videoId, { duracionSeg: 3 }, 'tGallinas')).status, 204);
+  const pagoId = crypto.randomUUID();
+  assert.equal((await enviar('ya_pague', pagoId, {}, 'tGallinas')).status, 204);
+  assert.equal((await enviar('ya_pague_tiempo', pagoId, { duracionSeg: 2 }, 'tGallinas')).status, 204);
+  const metricas = '/admin/cursos/promociones/metricas?origenSlug=directo&destinoSlug=' + slug;
+  const respuesta = await api(metricas, { token: 'tAdmin' });
+  assert.equal(respuesta.status, 200);
+  const { totales, personas, eventos } = respuesta.data;
+  assert.equal(totales.enlace_tiempo.eventos, 1);
+  assert.equal(totales.enlace_tiempo.duracionSeg, 3);
+  assert.equal(totales.checkout_tiempo.eventos, 1);
+  assert.equal(totales.checkout_tiempo.duracionSeg, 4);
+  assert.equal(totales.checkout_montado.anonimos, 1);
+  assert.equal(totales.video_reproducido.anonimos, 1);
+  assert.equal(totales.video_tiempo.duracionSeg, 3);
+  assert.equal(totales.ya_pague_tiempo.identificados, 1);
+  assert.equal(totales.ya_pague_tiempo.duracionSeg, 2);
+  assert.ok(personas.some(persona => persona.anonimo && persona.email === null));
+  assert.ok(personas.some(persona => persona.email === users.tGallinas.email));
+  assert.equal(eventos.find(ev => ev.tipo === 'video_reproducido').modo, 'automatico');
+  assert.doesNotMatch(JSON.stringify(respuesta.data), /falso@example\.org/);
+  assert.ok(!JSON.stringify(respuesta.data).includes(visitaId));
+});
+
+test('se atribuye la oferta inversa sin descuento y la lista de compras sólo es visible al admin', async () => {
+  const destinoSlug = 'gallinas-de-postura', origenSlug = 'embutidos-artesanales';
+  db._get('cursosVenta/' + destinoSlug).precioNormalCentavos = 55000;
+  const visitaId = crypto.randomUUID();
+  const pago = await api('/crear-checkout-curso', {
+    method: 'POST', body: { slug: destinoSlug, visitaId, atribucionOrigen: origenSlug }
+  });
+  assert.equal(pago.status, 200);
+  assert.equal(pago.data.oferta, undefined);
+  assert.equal(stripeMock.checkoutCreados.at(-1).line_items[0].price_data.unit_amount, 55000);
+  const mount = await api('/publico/cursos/actividad', {
+    method: 'POST', body: { destinoSlug, origenSlug, visitaId, tipo: 'checkout_montado', sessionId: pago.data.sessionId }
+  });
+  assert.equal(mount.status, 204);
+  const path = '/admin/cursos/compras?slug=' + destinoSlug;
+  assert.equal((await api(path, { token: 'tGallinas' })).status, 403);
+  const lista = await api(path, { token: 'tAdmin' });
+  assert.equal(lista.status, 200);
+  assert.ok(lista.data.compras.every(c => c.slug === destinoSlug));
+  assert.equal(lista.data.compras.find(c => c.sessionId === 'cs_gal').acceso.activo, true);
+  const resumen = await api(`/admin/cursos/promociones/metricas?origenSlug=${origenSlug}&destinoSlug=${destinoSlug}`, { token: 'tAdmin' });
+  assert.equal(resumen.data.totales.checkout_creado.eventos, 1);
+  assert.equal(resumen.data.totales.checkout_montado.eventos, 1);
 });
 
 // ─── Bunny + solicitudes de certificado ─────────────────────────────────────
