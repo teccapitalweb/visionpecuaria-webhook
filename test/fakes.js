@@ -59,7 +59,10 @@ class FakeQuery {
     const depth = this.path.split('/').length + 1;
     let docs = [...this.db.data.entries()]
       .filter(([k]) => k.startsWith(this.path + '/') && k.split('/').length === depth)
-      .filter(([, v]) => this.filters.every(([f, , val]) => v[f] === val))
+      .filter(([, v]) => this.filters.every(([f, op, val]) => {
+        if (op === '>=') return v[f] >= val;
+        return v[f] === val;
+      }))
       .map(([k, v]) => new FakeSnap(k.split('/').pop(), clone(v), new FakeDoc(this.db, k)));
     if (this.order) {
       const [f, dir] = this.order;
@@ -96,13 +99,25 @@ function fakeAuth(users = {}) {
 }
 
 function fakeStripe(sessions = {}) {
+  const checkoutCreados = [], clientesCreados = [];
   return {
+    checkoutCreados,
+    clientesCreados,
+    customers: {
+      async create(datos) {
+        clientesCreados.push(datos);
+        return { id: 'cus_test_promo_' + clientesCreados.length };
+      }
+    },
     checkout: { sessions: {
       async retrieve(id) {
         if (!sessions[id]) { const e = new Error('No such session'); e.type = 'StripeInvalidRequestError'; throw e; }
         return sessions[id];
       },
-      async create() { return { id: 'cs_test_new', client_secret: 'secret' }; }
+      async create(datos) {
+        checkoutCreados.push(datos);
+        return { id: 'cs_test_new', client_secret: 'secret' };
+      }
     } },
     webhooks: { constructEvent(body) { return JSON.parse(Buffer.isBuffer(body) ? body.toString() : body); } },
     subscriptions: {}

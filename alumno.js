@@ -19,6 +19,7 @@
 // ═════════════════════════════════════════════════════════════════════════════
 const crypto = require('crypto');
 const { regaloVigente, aplicarRegalo } = require('./regalos');
+const { registrarMetricasPromocion } = require('./promocion-analytics');
 
 const BUCKET_DEFAULT = 'visionpecuaria-vip.firebasestorage.app';
 const URL_FIRMADA_MS = 2 * 60 * 60 * 1000; // 2 h
@@ -186,6 +187,8 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
     if (!a.exists) { res.status(403).json({ error: 'Solo administradores' }); return null; }
     return u;
   }
+
+  registrarMetricasPromocion(app, { db, tokenRequerido, adminRequerido, log });
 
   async function auditar(adminUser, accion, datos) {
     await db.collection('auditoriaCursos').add({
