@@ -1,3 +1,5 @@
+const { orientacionBase } = require('./gallo-orientacion');
+
 const CURSOS = {
   'gallinas-de-postura': {
     nombre: 'Manejo Profesional de Gallinas de Postura',
@@ -154,6 +156,8 @@ function armarRespuesta(cursoActual, mensaje, historial, ficha) {
   const anteriores = historialUsuario(historial);
   const slug = cursoDePregunta(cursoActual, texto, anteriores);
   const curso = CURSOS[slug];
+  const orientacion = orientacionBase(texto, slug, anteriores);
+  if (orientacion) return orientacion;
   let tema = intencion(texto);
   let unidad = unidadMencionada(texto, curso);
   const seguimiento = /^(y |entonces |tambien |donde\b|como\b|cuanto\b|en que\b|que hago\b)/.test(texto) && texto.split(' ').length <= 12;
@@ -193,8 +197,8 @@ function armarRespuesta(cursoActual, mensaje, historial, ficha) {
     return { texto: `El temario de ${curso.nombre} incluye ${nombre}. ${unidad.texto}\n¿Quieres consultar las clases del aula o revisar otro tema?`, reformular: true };
   }
 
-  if (/^(hola|buenos dias|buenas tardes|buenas noches|buenas|que tal|hey)$/.test(texto)) {
-    return { texto: `¡Hola! Desde aquí puedes preguntarme sobre ${curso.nombre}, Embutidos, Gallinas, Sexaje Avícola o cómo usar el aula. ¿Qué te gustaría revisar?`, reformular: false };
+  if (/^(hola|buenos dias|buenas tardes|buenas noches|buenas|que tal|hey)( (mi )?gallo( ia)?)?$/.test(texto)) {
+    return { texto: '¡Hola! Soy tu Gallo IA. Puedo ayudarte a repasar ' + curso.nombre + ', ubicar tus clases y materiales o resolver dudas sobre el aula. ¿Qué te gustaría revisar?', reformular: false };
   }
   if (/^(muchas )?gracias( .*)?$/.test(texto)) {
     return { texto: '¡De nada! Si quieres, seguimos con otra clase o con una duda sobre el aula.', reformular: false };
@@ -291,7 +295,7 @@ function registrarGalloIA(app, { tokenRequerido, accesoA, leerCurso, normalizarC
       }
       const guia = armarRespuesta(cursoSlug, mensaje, historial, ficha);
       const ia = guia.reformular ? await reformularConGemini(guia.texto) : null;
-      return res.json({ respuesta: ia || guia.texto, modo: ia ? 'ia' : 'guia' });
+      return res.json({ respuesta: ia || guia.texto, modo: ia ? 'ia' : 'guia', ...(guia.fuentes ? { fuentes: guia.fuentes } : {}) });
     } catch (e) {
       log.error('Mi Gallo IA: no se pudo preparar una respuesta.', e.code || e.name);
       return res.status(500).json({ error: 'No pudimos responder en este momento. Inténtalo de nuevo.' });
