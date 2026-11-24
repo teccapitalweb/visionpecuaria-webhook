@@ -241,9 +241,9 @@ function evento(res, tipo, datos) {
   if (!res.writableEnded && !res.destroyed) res.write(`event: ${tipo}\ndata: ${JSON.stringify(datos)}\n\n`);
 }
 
-function registrarGalloIA(app, { db, tokenRequerido, accesoA, leerCurso, normalizarClases, memoria, recuperar, log = console }) {
+function registrarGalloIA(app, { db, tokenRequerido, accesoA, leerCurso, normalizarClases, memoria, recuperar,
+  log = console, motor = crearMotorGallo({ db, recuperar, log }) }) {
   const esperar = limitadorMensajes();
-  const motor = crearMotorGallo({ db, recuperar, log });
   app.post('/alumno/gallo-ia', async (req, res) => {
     res.setHeader('Cache-Control', 'private, no-store');
     const flujo = /(?:^|[,\s])text\/event-stream(?:[,;\s]|$)/i.test(req.get('accept') || '');
@@ -284,21 +284,21 @@ function registrarGalloIA(app, { db, tokenRequerido, accesoA, leerCurso, normali
       const destino = cursoDePregunta(cursoSlug, texto, historialUsuario(recientes));
       const tema = intencion(texto);
       const pideDatosAula = buscarClases(texto) || tema === 'temario' && /quien|ponent|instructor/.test(texto);
+      const consultaAula = pideDatosAula || TEMAS_AULA.has(tema);
+      const requierePermisoDestino = pideDatosAula || (usarModelo === true && !consultaAula);
+      const permiso = destino === cursoSlug ? acceso : requierePermisoDestino ? await accesoA(usuario, destino) : null;
+      const destinoPermitido = Boolean(permiso && permiso.revocado !== true);
       let ficha = null;
-      if (pideDatosAula) {
-        const permiso = destino === cursoSlug ? acceso : await accesoA(usuario, destino);
-        if (permiso && permiso.revocado !== true) {
-          const datos = await leerCurso(destino);
-          if (datos) {
-            const clases = normalizarClases(datos.clases).map(({ titulo, estado }) => ({ titulo: String(titulo).slice(0, 160), estado }));
-            ficha = { clases, instructor: datos.instructorNombre };
-          }
+      if (pideDatosAula && destinoPermitido) {
+        const datos = await leerCurso(destino);
+        if (datos) {
+          const clases = normalizarClases(datos.clases).map(({ titulo, estado }) => ({ titulo: String(titulo).slice(0, 160), estado }));
+          ficha = { clases, instructor: datos.instructorNombre };
         }
       }
       const guia = armarRespuesta(cursoSlug, mensaje, recientes, ficha);
-      const consultaAula = pideDatosAula || TEMAS_AULA.has(tema);
       const resultado = await motor({
-        cursoSlug: destino,
+        cursoSlug: destinoPermitido ? destino : cursoSlug,
         mensaje,
         historial: recientes,
         usarModelo: usarModelo === true && !consultaAula,

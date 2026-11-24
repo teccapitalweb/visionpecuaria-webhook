@@ -28,8 +28,8 @@ visibles para administradores solo cuando el alumno elige compartir ese turno.
 
 ### Configuración del modelo
 
-Configura las variables directamente en el servicio de Railway. La aplicación no envía peticiones
-de chat a OpenAI hasta que exista configuración completa y el alumno acepte el uso del modelo.
+Configura las variables directamente en el servicio de Railway. La aplicación requiere configuración
+completa antes de enviar peticiones a OpenAI. El alumno debe aceptar el uso del modelo en el chat.
 Consulta los [modelos y precios vigentes](https://developers.openai.com/api/docs/pricing)
 antes de establecer los importes.
 
@@ -61,8 +61,10 @@ Los recortes de fuentes y el contexto limitado evitan enviar la biblioteca compl
 - Para enviar un extracto a OpenAI, la revisión debe estar aprobada, visible a alumnos, dentro del
   alcance del curso y autorizada explícitamente para procesamiento externo. Cambiar una fuente
   crea una revisión pendiente. Desactivarla interrumpe la recuperación.
-- El Centro de conocimiento permite convertir una corrección compartida en borrador. Las
-  evaluaciones de referencia ejecutan la guía y los controles locales, sin llamar al proveedor.
+- El Centro de conocimiento permite convertir una corrección compartida en borrador. Evaluar la
+  guía ejecuta los controles locales. Probar el modelo envía un caso ficticio por ejecución,
+  usa el mismo tope diario del chat y comprueba valores esperados. Los resultados sirven para
+  revisar los cálculos, el contexto y la comprensión de cada pregunta de referencia.
 
 ### Validación de una publicación
 

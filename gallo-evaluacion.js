@@ -1,7 +1,7 @@
 const { armarRespuesta } = require('./gallo-ia');
-const { crearMotorGallo } = require('./gallo-motor');
+const { crearMotorGallo, VERSION_MOTOR } = require('./gallo-motor');
 
-const VERSION_SUITE = 'gallo-referencia-1';
+const VERSION_SUITE = 'gallo-referencia-2';
 const GALLINAS = 'gallinas-de-postura';
 const EMBUTIDOS = 'embutidos-artesanales';
 const SEXAJE = 'sexaje-avicola';
@@ -25,6 +25,19 @@ const CASOS = [
 ];
 const catalogo = () => CASOS.map(({ criterio, ...caso }) => caso);
 
+const CASOS_MODELO = [
+  { id: 'postura', pregunta: 'tengo 100 gallinas y ponen 70 huevos al dia q porcentaje de postura es',
+    objetivo: 'Calcula el 70 % y explicita el supuesto de 100 aves durante el periodo.',
+    referencias: [/\b70\s*(?:%|por ciento)/i, /\b100\b/] },
+  { id: 'nutricion-contexto', pregunta: 'y si comen 20 kilos al dia cuanto es x cada una',
+    historial: [{ rol: 'usuario', texto: 'Tengo 100 gallinas de postura.' }],
+    objetivo: 'Conserva el número de animales y calcula 200 gramos diarios por gallina.',
+    referencias: [/\b200\s*(?:g\b|gramos)/i, /por (?:gallina|ave)|cada (?:gallina|ave)/i] },
+  { id: 'ganaderia', pregunta: 'mis 20 becerros ganaron 18 kilos por cabeza en 30 dias como saco ganansia diaria',
+    objetivo: 'Calcula 0.6 kg o 600 g diarios por becerro y explica la división entre días.',
+    referencias: [/\b(?:0[.,]6\s*(?:kg\b|kilo)|600\s*(?:g\b|gramos))/i, /30\s*d[ií]as/i] }
+];
+
 async function evaluarGuia() {
   const motorLocal = crearMotorGallo({ env: {} });
   const resultados = await Promise.all(CASOS.map(async caso => {
@@ -38,19 +51,51 @@ async function evaluarGuia() {
     aprobadas: resultados.filter(r => r.satisfactorio).length, resultados };
 }
 
-function registrarEvaluacionesGallo(app, { adminRequerido, log = console }) {
+async function evaluarModelo(motor, caso, senal) {
+  const resultado = await motor({ cursoSlug: GALLINAS, mensaje: caso.pregunta,
+    historial: caso.historial || [], usarModelo: true, senal });
+  if (resultado?.modo !== 'ia') return null;
+  const respuesta = resultado.respuesta;
+  const satisfactorio = caso.referencias.every(referencia => referencia.test(respuesta));
+  return { suiteVersion: VERSION_SUITE, motorVersion: VERSION_MOTOR, modo: 'ia', total: 1,
+    aprobadas: Number(satisfactorio), resultados: [{ id: caso.id, objetivo: caso.objetivo, satisfactorio, respuesta }] };
+}
+
+function registrarEvaluacionesGallo(app, { adminRequerido, db, recuperar, modeloDisponible, log = console, env, fetchModelo }) {
   const route = '/admin/gallo-ia/evaluaciones';
+  const motor = crearMotorGallo({ db, recuperar, log, env, fetchModelo });
   const handler = (respuesta) => async (req, res) => {
     res.setHeader('Cache-Control', 'private, no-store');
     try {
-      if (await adminRequerido(req, res)) return res.json(await respuesta());
+      if (await adminRequerido(req, res)) return await respuesta(req, res);
     } catch (e) {
       log.error('Mi Gallo IA: evaluación no disponible', e.code || e.name);
       return res.status(500).json({ error: 'No pudimos consultar la evaluación.' });
     }
   };
-  app.get(route, handler(() => ({ suiteVersion: VERSION_SUITE, casos: catalogo() })));
-  app.post(route, handler(evaluarGuia));
+  app.get(route, handler((req, res) => res.json({
+    suiteVersion: VERSION_SUITE,
+    casos: catalogo(),
+    casosModelo: CASOS_MODELO.map(({ id, pregunta, objetivo }) => ({ id, pregunta, objetivo })),
+    modeloDisponible: modeloDisponible()
+  })));
+  app.post(route, handler(async (req, res) => {
+    if (!req.body?.modo || req.body.modo === 'guia') return res.json(await evaluarGuia());
+    const caso = CASOS_MODELO.find(item => item.id === req.body.casoId);
+    if (req.body.modo !== 'ia' || !caso) return res.status(400).json({ error: 'Selecciona un caso de referencia válido.' });
+    if (!modeloDisponible()) return res.status(503).json({ error: 'Todavía falta configurar el proveedor y sus límites.' });
+    const abortar = new AbortController();
+    const cerrar = () => abortar.abort();
+    res.once('close', cerrar);
+    try {
+      const informe = await evaluarModelo(motor, caso, abortar.signal);
+      if (abortar.signal.aborted) return;
+      if (!informe) return res.status(503).json({ error: 'El modelo no devolvió una respuesta verificable. Revisa la configuración y el consumo.' });
+      return res.json(informe);
+    } finally {
+      res.removeListener('close', cerrar);
+    }
+  }));
 }
 
 module.exports = { registrarEvaluacionesGallo, evaluarGuia };

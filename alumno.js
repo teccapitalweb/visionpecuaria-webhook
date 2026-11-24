@@ -204,12 +204,13 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
       'tokensEntrada', 'tokensSalida', 'aviso80En', 'avisoLimiteEn'];
     return Object.fromEntries(permitidos.filter(campo => dato[campo] !== undefined).map(campo => [campo, dato[campo]]));
   };
+  const recuperarGallo = ({ consulta, ...opciones }) => buscarConocimientoGallo(db, { pregunta: consulta, ...opciones });
   registrarGalloIA(app, { db, tokenRequerido, accesoA, leerCurso, normalizarClases, log,
-    memoria: memoriaGallo, recuperar: ({ consulta, ...opciones }) => buscarConocimientoGallo(db, { pregunta: consulta, ...opciones }) });
+    memoria: memoriaGallo, recuperar: recuperarGallo });
   registrarMemoriaGallo(app, { memoria: memoriaGallo, tokenRequerido, accesoA, adminRequerido,
     modeloDisponible, leerConsumo, log });
   registrarConocimientoGallo(app, { db, adminRequerido, log });
-  registrarEvaluacionesGallo(app, { adminRequerido, log });
+  registrarEvaluacionesGallo(app, { adminRequerido, db, recuperar: recuperarGallo, modeloDisponible, log });
 
   async function auditar(adminUser, accion, datos) {
     await db.collection('auditoriaCursos').add({

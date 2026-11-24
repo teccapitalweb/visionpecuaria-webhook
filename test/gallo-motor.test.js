@@ -4,6 +4,7 @@ const { EventEmitter } = require('node:events');
 const { FakeDB } = require('./fakes');
 const { crearMotorGallo, VERSION_MOTOR } = require('../gallo-motor');
 const { registrarGalloIA } = require('../gallo-ia');
+const { registrarEvaluacionesGallo } = require('../gallo-evaluacion');
 
 const env = {
   OPENAI_API_KEY: 'clave-simulada-sin-acceso',
@@ -26,6 +27,44 @@ function respuestaProveedor(respuesta, citas = []) {
     })
   };
 }
+
+test('la prueba del modelo acepta casos fijos, exige rol y cuenta el consumo', async () => {
+  const db = new FakeDB();
+  let handler;
+  let llamadas = 0;
+  let habilitado = false;
+  registrarEvaluacionesGallo({ get() {}, post(path, funcion) { handler = funcion; } }, {
+    db, env, log, modeloDisponible: () => habilitado,
+    adminRequerido: async (req, res) => req.esAdmin || (res.status(403).json({ error: 'Solo administradores' }), false),
+    fetchModelo: async (url, req) => {
+      const entrada = JSON.parse(JSON.parse(req.body).input);
+      assert.match(entrada.conversacion[0].texto, /100 gallinas/);
+      assert.match(entrada.pregunta, /20 kilos/);
+      llamadas++;
+      return respuestaProveedor('Son 200 g diarios por gallina. El consumo total se divide entre 100 aves.');
+    }
+  });
+  async function probar(casoId, esAdmin = true) {
+    const res = new EventEmitter();
+    res.setHeader = () => {};
+    res.codigo = 200;
+    res.status = (codigo) => { res.codigo = codigo; return res; };
+    res.json = (contenido) => { res.contenido = contenido; return res; };
+    await handler({ esAdmin, body: { modo: 'ia', casoId } }, res);
+    return res;
+  }
+  assert.equal((await probar('nutricion-contexto', false)).codigo, 403);
+  assert.equal((await probar('caso-arbitrario')).codigo, 400);
+  assert.equal((await probar('nutricion-contexto')).codigo, 503);
+  assert.equal(llamadas, 0);
+  habilitado = true;
+  const res = await probar('nutricion-contexto');
+  assert.equal(res.codigo, 200);
+  assert.equal(res.contenido.modo, 'ia');
+  assert.equal(res.contenido.aprobadas, 1);
+  assert.equal(llamadas, 1);
+  assert.equal(db.dump('galloIAConsumoDiario/')[0].solicitudes, 1);
+});
 
 test('el proveedor y la búsqueda externa requieren consentimiento explícito y presupuesto configurado', async () => {
   const db = new FakeDB();
@@ -178,4 +217,27 @@ test('SSE entrega texto y final compatible con JSON, con recibo y sin depender d
   assert.equal(final.data.version, VERSION_MOTOR);
   assert.deepEqual(final.data.fuentes, []);
   assert.equal(res.writableEnded, true);
+});
+
+test('mencionar otro curso no permite recuperar sus fuentes sin acceso vigente', async () => {
+  let atender;
+  let bonusVigente = false;
+  let ambito;
+  registrarGalloIA({ post(path, handler) { atender = handler; } }, {
+    tokenRequerido: async (req) => ({ uid: req.uid }),
+    accesoA: async (alumno, slug) => slug === cursoSlug ? {} : { revocado: !bonusVigente },
+    motor: async ({ cursoSlug: alcance }) => { ambito = alcance; return null; },
+    log
+  });
+  async function consultar(uid) {
+    const res = new EventEmitter();
+    res.setHeader = () => {};
+    res.json = () => {};
+    await atender({ uid, body: { cursoSlug, mensaje: 'que indicadores productivos se usan en sexaje avícola',
+      usarModelo: true }, get: () => '' }, res);
+    return ambito;
+  }
+  assert.equal(await consultar('alumno-1'), cursoSlug);
+  bonusVigente = true;
+  assert.equal(await consultar('alumno-2'), 'sexaje-avicola');
 });
