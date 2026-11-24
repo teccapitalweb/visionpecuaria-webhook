@@ -18,7 +18,7 @@
 //     "última clase" solo cambia con una marca de tiempo más nueva).
 // ═════════════════════════════════════════════════════════════════════════════
 const crypto = require('crypto');
-const { regaloVigente, aplicarRegalo } = require('./regalos');
+const { regaloParaPago, aplicarRegalo } = require('./regalos');
 const { registrarMetricasPromocion } = require('./promocion-analytics');
 const { registrarGalloIA } = require('./gallo-ia');
 
@@ -232,7 +232,18 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
       try {
         const s = await stripe.checkout.sessions.retrieve(compra.sessionId);
         if (s.payment_status === 'paid' || s.payment_status === 'no_payment_required') {
-          await db.collection('comprasCurso').doc(compra.sessionId).set({ estado: 'confirmado', confirmadoEn: new Date().toISOString() }, { merge: true });
+          const observadoPagadoEn = new Date();
+          const regalo = s.metadata?.slug === compra.slug
+            ? await regaloParaPago(db, s, observadoPagadoEn).catch(e => {
+              log.warn('No pudimos revisar el regalo de la compra pendiente:', e.code || e.name);
+              return null;
+            })
+            : null;
+          await db.collection('comprasCurso').doc(compra.sessionId).set({
+            estado: 'confirmado', confirmadoEn: observadoPagadoEn.toISOString(),
+            ...(regalo ? { regalo } : {})
+          }, { merge: true });
+          if (regalo) compra.regalo = regalo;
           return true;
         }
       } catch (e) { log.warn('No se pudo revisar compra pendiente:', e.message); }
@@ -360,7 +371,7 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
       }
       if (registrado) {
         const compra = (await db.collection('comprasCurso').doc(sessionId).get()).data() || {};
-        if (compra.regalo) base.regalo = compra.regalo;
+        if (compra.estado === 'confirmado' && compra.regalo) base.regalo = compra.regalo;
       }
 
       const reciente = !s.created || (Date.now() / 1000 - Number(s.created)) <= VENTANA_ENTRADA_SEG;
@@ -942,14 +953,19 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
         if (!(s.payment_status === 'paid' || s.payment_status === 'no_payment_required') || s.metadata?.tipo !== 'curso') {
           return res.status(409).json({ error: 'Stripe no reporta este pago de curso como pagado' });
         }
+        const observadoPagadoEn = new Date();
+        const regalo = await regaloParaPago(db, s, observadoPagadoEn).catch(e => {
+          log.warn('No pudimos revisar el regalo al conciliar la compra:', e.code || e.name);
+          return null;
+        });
         compra = {
           sessionId, slug: s.metadata.slug, uid: s.metadata.uid || null,
           email: (s.customer_email || s.customer_details?.email || '').toLowerCase(),
           nombre: s.metadata.nombre || '', whatsapp: s.metadata.whatsapp || '',
           estado: 'confirmado', fechaCompra: new Date(s.created * 1000).toISOString(),
-          montoPagadoCentavos: s.amount_total || 0, recuperadoDesdeStripe: true
+          montoPagadoCentavos: s.amount_total || 0, recuperadoDesdeStripe: true,
+          ...(regalo ? { regalo } : {})
         };
-        compra.regalo = await regaloVigente(db, compra.slug, compra.fechaCompra);
         await db.collection('comprasCurso').doc(sessionId).set(compra, { merge: true });
       }
       if (!compra.slug) return res.status(409).json({ error: 'La compra no indica el curso' });

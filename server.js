@@ -1,7 +1,7 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const Stripe = require('stripe');
-const { regaloVigente, aplicarRegalo } = require('./regalos');
+const { apartarRegalo, metadataRegaloCheckout, regaloParaPago, aplicarRegalo } = require('./regalos');
 const { obtenerOfertaPromocional, precioVigenteCentavos, OFERTAS_PROMOCIONALES } = require('./promociones-cursos');
 const {
   guardarEventoPromo, registrarCheckoutActividad, registrarCompraPagada,
@@ -434,11 +434,25 @@ app.get('/alumno/promociones/cotizacion', async (req, res) => {
   }
 });
 
+app.post('/publico/cursos/regalo/apartar', async (req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  try {
+    const { cursoSlug, navegadorId } = req.body || {};
+    const reserva = await apartarRegalo(db, { cursoSlug, navegadorId, secretoWebhook: STRIPE_WEBHOOK_SECRET });
+    res.json({ ...reserva, ahora: new Date().toISOString() });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    console.error('No se pudo apartar el regalo de curso:', err.code || err.name);
+    res.status(503).json({ error: 'No pudimos verificar esta oferta. Intenta de nuevo.' });
+  }
+});
+
 app.post('/crear-checkout-curso', async (req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
   try {
     const {
       slug: slugRaw, uid: uidRaw, email: emailRaw, nombre: nombreRaw, whatsapp: whatsappRaw,
-      origenSlug: origenRaw, atribucionOrigen, visitaId: visitaRaw, dispositivo
+      origenSlug: origenRaw, atribucionOrigen, visitaId: visitaRaw, dispositivo, navegadorId, reservaRegalo
     } = req.body || {};
 
     const slug = sanearTexto(slugRaw);
@@ -504,6 +518,9 @@ app.post('/crear-checkout-curso', async (req, res) => {
     const nombreCurso = curso.nombre || curso.titulo || 'Curso Visión Pecuaria';
     // Stripe fija el correo al usar un Customer con email. Un prellenado por sí solo se puede editar.
     const clientePromo = oferta ? await stripe.customers.create({ email, ...(nombre ? { name: nombre } : {}), metadata: { uid } }) : null;
+    const regalo = metadataRegaloCheckout({
+      cursoSlug: slug, navegadorId, token: reservaRegalo, secretoWebhook: STRIPE_WEBHOOK_SECRET
+    });
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       ui_mode: 'embedded',
@@ -528,6 +545,7 @@ app.post('/crear-checkout-curso', async (req, res) => {
         nombre,
         whatsapp,
         email,
+        ...regalo.metadata,
         ...(oferta ? { promoOrigenSlug: origenSlug, promoDescuentoCentavos: String(oferta.descuentoCentavos) } : {})
       },
       // Gallinas y Embutidos tienen el aula dentro de su propia landing: al pagar se vuelve ahí y se entra directo.
@@ -557,6 +575,7 @@ app.post('/crear-checkout-curso', async (req, res) => {
     res.json({
       clientSecret: session.client_secret,
       sessionId: session.id,
+      ...(regalo.reservado ? { regaloReservado: regalo.reservado } : {}),
       ...(oferta ? { oferta } : {})
     });
 
@@ -615,19 +634,20 @@ app.get('/verificar-session-curso', async (req, res) => {
       if (slug && compra.slug && compra.slug !== slug) {
         return noValido('Este pago no corresponde a este curso');
       }
-      if (compra.estado && compra.estado !== 'confirmado') {
-        return noValido('Pago no confirmado aún');
+      if (!compra.estado || compra.estado === 'confirmado') {
+        return res.json({
+          ok: true,
+          valido: true,
+          slug: compra.slug,
+          nombre: compra.nombre || '',
+          email: compra.email || '',
+          whatsapp: compra.whatsapp || '',
+          fechaCompra: compra.fechaCompra || null,
+          montoPagadoCentavos: compra.montoPagadoCentavos || 0,
+          ...(compra.regalo ? { regalo: compra.regalo } : {})
+        });
       }
-      return res.json({
-        ok: true,
-        valido: true,
-        slug: compra.slug,
-        nombre: compra.nombre || '',
-        email: compra.email || '',
-        whatsapp: compra.whatsapp || '',
-        fechaCompra: compra.fechaCompra || null,
-        montoPagadoCentavos: compra.montoPagadoCentavos || 0
-      });
+      if (compra.estado !== 'pendiente') return noValido('Pago no confirmado aún');
     }
 
     // 2) Fallback: consultar directamente a Stripe.
@@ -649,12 +669,17 @@ app.get('/verificar-session-curso', async (req, res) => {
       if (session.payment_status !== 'paid') {
         return noValido('Pago no completado en Stripe');
       }
+      const observadoPagadoEn = new Date();
       const meta = session.metadata || {};
       if (slug && meta.slug && meta.slug !== slug) {
         return noValido('Este pago no corresponde a este curso');
       }
       // Como no había registro, lo creamos ahora (recuperación automática)
       const email = (session.customer_email || session.customer_details?.email || '').toLowerCase().trim();
+      const regalo = await regaloParaPago(db, session, observadoPagadoEn).catch(err => {
+        console.warn('No pudimos revisar el regalo al recuperar el pago:', err.code || err.name);
+        return null;
+      });
       const compraRecuperada = {
         sessionId: session.id,
         slug: meta.slug || slug || null,
@@ -666,6 +691,7 @@ app.get('/verificar-session-curso', async (req, res) => {
         fechaCompra: new Date(session.created * 1000).toISOString(),
         montoPagadoCentavos: session.amount_total || 0,
         stripeCustomerId: session.customer || null,
+        ...(regalo ? { regalo } : {}),
         recuperadoDesdeStripe: true
       };
       try {
@@ -683,6 +709,7 @@ app.get('/verificar-session-curso', async (req, res) => {
         whatsapp: compraRecuperada.whatsapp,
         fechaCompra: compraRecuperada.fechaCompra,
         montoPagadoCentavos: compraRecuperada.montoPagadoCentavos,
+        ...(regalo ? { regalo } : {}),
         _fromStripe: true
       });
     } catch (e) {
@@ -752,13 +779,13 @@ async function procesarCompraCurso(session, fechaConfirmacion) {
         return;
       }
 
-      // La elegibilidad se fija con la fecha real de la sesión, no con la hora
-      // de un eventual reintento tardío del webhook.
+      // Se conserva la fecha de la sesión en el historial. Para la ventana del
+      // regalo se toma la confirmación del pago de Stripe.
       const fechaISO = session.created
         ? new Date(Number(session.created) * 1000).toISOString()
         : new Date().toISOString();
       const montoCentavos = session.amount_total || 0;
-      const regalo = await regaloVigente(db, slug, fechaISO);
+      const regalo = await regaloParaPago(db, session, fechaConfirmacion);
       const moneda = /^[a-z]{3}$/i.test(session.currency || '') ? session.currency.toLowerCase() : 'mxn';
       const promoOrigenSlug = session.metadata?.promoOrigenSlug;
       const promoDescuentoCentavos = Number(session.metadata?.promoDescuentoCentavos);

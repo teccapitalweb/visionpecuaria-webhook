@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const Module = require('module');
 const crypto = require('crypto');
 const { FakeDB, fakeAuth, fakeStripe, fakeAdmin } = require('./fakes');
+const { apartarRegalo, metadataRegaloCheckout } = require('../regalos');
 
 const PORT = 38000 + Math.floor(Math.random() * 1000);
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -57,6 +58,7 @@ Module._load = function (req, ...rest) {
 };
 process.env.FIREBASE_SERVICE_ACCOUNT = '{}';
 process.env.STRIPE_SECRET_KEY = 'sk_test_x';
+process.env.STRIPE_WEBHOOK_SECRET = 'whsec_prueba_local_sin_stripe';
 process.env.PORT = String(PORT);
 const silenciar = ['log', 'warn', 'error'].map(k => [k, console[k]]);
 silenciar.forEach(([k]) => { console[k] = () => {}; });
@@ -828,4 +830,101 @@ test('entrar por pago: pagar con el correo de una cuenta que ya existe NO entreg
   assert.equal(r.data.cuentaExistente, true);
   assert.equal(r.data.token, undefined);
   assert.equal(db._get('entradasPorPago/cs_de_otro'), undefined);
+});
+
+test('checkout y webhook de Sexaje honran la reserva del navegador y la hora real del pago', async () => {
+  const cursoSlug = 'gallinas-de-postura';
+  const navegadorId = crypto.randomUUID();
+  const regalo = { slug: 'sexaje-avicola', desde: new Date(Date.now() - 86400000).toISOString() };
+  await db.collection('cursosVenta').doc(cursoSlug).set({ regalo }, { merge: true });
+  const apartar = (body) => api('/publico/cursos/regalo/apartar', { method: 'POST', body });
+  assert.equal((await apartar({ cursoSlug, navegadorId: 'falso' })).status, 400);
+  const reserva = await apartar({ cursoSlug, navegadorId });
+  assert.equal(reserva.status, 200);
+  assert.equal(reserva.data.cursoRegaloSlug, 'sexaje-avicola');
+  assert.equal((await apartar({ cursoSlug, navegadorId })).data.venceEn, reserva.data.venceEn);
+
+  const crear = async (cuerpo) => {
+    const pago = await api('/crear-checkout-curso', { method: 'POST', body: { slug: cursoSlug, ...cuerpo } });
+    assert.equal(pago.status, 200);
+    return { ...pago.data, metadata: stripeMock.checkoutCreados.at(-1).metadata };
+  };
+  const token = reserva.data.token;
+  const conReserva = await crear({ reservaRegalo: token, navegadorId });
+  const fuera = await crear({ reservaRegalo: token, navegadorId });
+  const sinReserva = await crear({ regaloSlug: 'sexaje-avicola', regaloVersion: '1' });
+  const otroNavegador = await crear({ reservaRegalo: token, navegadorId: crypto.randomUUID() });
+  assert.equal(conReserva.metadata.regaloVersion, '2');
+  assert.equal(conReserva.metadata.regaloSlug, 'sexaje-avicola');
+  assert.equal(conReserva.regaloReservado.venceEn, reserva.data.venceEn);
+  assert.ok(!JSON.stringify(conReserva.metadata).includes(token));
+  assert.ok(!JSON.stringify(conReserva.metadata).includes(navegadorId));
+  for (const pago of [sinReserva, otroNavegador]) {
+    assert.equal(pago.metadata.regaloVersion, '2');
+    assert.equal(pago.metadata.regaloSlug, undefined);
+    assert.equal(pago.regaloReservado, undefined);
+  }
+
+  const emitida = Number(conReserva.metadata.regaloEmitidaEn);
+  const vence = Number(conReserva.metadata.regaloVenceEn);
+  const sesion = (compra, email, status) => ({
+    id: compra.sessionId, created: emitida + 1, payment_status: status, amount_total: 55000, currency: 'mxn',
+    metadata: compra.metadata, customer_details: { email, name: 'Alumno de prueba' }
+  });
+  const evento = (type, created, object) => ({ id: 'evt_' + object.id + '_' + type, type, created, data: { object } });
+  const rDentro = sesion(conReserva, 'reserva-dentro@example.org', 'unpaid');
+  assert.equal(await webhook(evento('checkout.session.completed', emitida + 10, rDentro)), 200);
+  assert.equal(db._get('comprasCurso/' + rDentro.id).regalo, undefined);
+  const diferido = evento('checkout.session.async_payment_succeeded', vence - 1, { ...rDentro, payment_status: 'paid' });
+  assert.equal(await webhook(diferido), 200);
+  assert.equal(await webhook(diferido), 200);
+  assert.equal(db._get('comprasCurso/' + rDentro.id).regalo, 'sexaje-avicola');
+  assert.equal(db._get('accesosCurso/' + sint(rDentro.customer_details.email) + '/cursos/sexaje-avicola').stripeSessionId, rDentro.id);
+
+  const rFuera = sesion(fuera, 'reserva-fuera@example.org', 'paid');
+  assert.equal(await webhook(evento('checkout.session.async_payment_succeeded', vence, rFuera)), 200);
+  assert.equal(db._get('comprasCurso/' + rFuera.id).estado, 'confirmado');
+  assert.equal(db._get('comprasCurso/' + rFuera.id).regalo, undefined);
+  const sinToken = sesion(sinReserva, 'sin-reserva@example.org', 'paid');
+  assert.equal(await webhook(evento('checkout.session.completed', emitida + 30, sinToken)), 200);
+  assert.equal(db._get('comprasCurso/' + sinToken.id).regalo, undefined);
+
+  const legacy = {
+    ...sinToken, id: 'cs_antes_ventana_sexaje',
+    metadata: { tipo: 'curso', slug: cursoSlug }, customer_details: { email: 'antes-ventana@example.org' }
+  };
+  assert.equal(await webhook(evento('checkout.session.completed', vence + 40, legacy)), 200);
+  assert.equal(db._get('comprasCurso/' + legacy.id).regalo, 'sexaje-avicola');
+});
+
+test('la recuperación de Stripe y la conciliación no inventan una hora previa a la caducidad', async () => {
+  const cursoSlug = 'embutidos-artesanales';
+  await db.collection('cursosVenta').doc(cursoSlug).set({
+    regalo: { slug: 'sexaje-avicola', desde: new Date(Date.now() - 86400000).toISOString() }
+  }, { merge: true });
+  const datos = { cursoSlug, navegadorId: crypto.randomUUID(), secretoWebhook: process.env.STRIPE_WEBHOOK_SECRET };
+  const ahora = new Date(Date.now() - 7200000);
+  const r = await apartarRegalo(db, { ...datos, ahora });
+  const checkout = metadataRegaloCheckout({ ...datos, ahora, token: r.token });
+  const sesion = {
+    created: Number(checkout.metadata.regaloEmitidaEn) + 1, payment_status: 'paid', amount_total: 55000,
+    metadata: { ...checkout.metadata, tipo: 'curso', slug: cursoSlug },
+    customer_details: { email: 'entrada-despues@example.org', name: 'Alumno de prueba' }
+  };
+  const vista = 'cs_recuperada_ventana';
+  stripeSessions[vista] = { ...sesion, id: vista };
+  const estado = await api('/verificar-session-curso?session_id=' + vista + '&slug=' + cursoSlug);
+  assert.equal(estado.status, 200);
+  assert.equal(estado.data.regalo, undefined);
+  assert.equal(db._get('comprasCurso/' + vista).regalo, undefined);
+
+  const conciliada = 'cs_admin_ventana_vencida';
+  stripeSessions[conciliada] = { ...sesion, id: conciliada };
+  const c = await api('/admin/cursos/conciliar', {
+    token: 'tAdmin', method: 'POST',
+    body: { sessionId: conciliada, emailDestino: users.tDestino.email, motivo: 'Comprobar compra recuperada' }
+  });
+  assert.equal(c.status, 200);
+  assert.equal(db._get('comprasCurso/' + conciliada).regalo, undefined);
+  assert.equal(db._get('accesosCurso/' + users.tDestino.uid + '/cursos/sexaje-avicola'), undefined);
 });
