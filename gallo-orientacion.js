@@ -1,10 +1,8 @@
+const { orientarAves } = require('./gallo-orientacion-aves');
+
 const FUENTES_AVICULTURA = [{
   titulo: 'Avicultura a pequeña escala · University of Minnesota Extension',
   url: 'https://extension.umn.edu/poultry/small-scale-poultry'
-}];
-const FUENTES_ALERTA_AVES = [{
-  titulo: 'Señales de enfermedad y cuidado de la parvada · USDA APHIS',
-  url: 'https://www.aphis.usda.gov/livestock-poultry-disease/avian/defend-the-flock/resources/how-protect-your-flock-avian-influenza'
 }];
 const FUENTES_POSTURA = [{
   titulo: 'Manejo de gallinas ponedoras · Manual veterinario Merck',
@@ -39,35 +37,8 @@ function orientacionBase(textoNormalizado, cursoSlug, historialNormalizado = [])
   const texto = textoNormalizado;
   const anterior = historialNormalizado[0] || '';
   const aves = /\b(pollit\w*|pollos?|gallinas?|aves?|parvada|ponedoras?)\b/;
-  const lesiones = /\b(granos?|granit\w*|bolitas?|puntitos?|costras?|lesion\w*|placas?|manchas?)\b/;
-  const enfermedad = /\b(enferm\w*|diarrea|decaid\w*|sintoma\w*|no comen?|muri[oó]|murieron|muertes?|dificultad para respirar|les cuesta respirar)\b/;
-  const alarma = /\b(dificultad para respirar|no (puede[n]? respirar|come[n]?)|les cuesta respirar|dejo de comer|dejaron de comer|muri[oó]|murieron|mortalidad|muertes? subitas?)\b/;
-  const indicaMedicamento = /\b(dosis|medicament\w*|medicina\w*|antibio\w*|que (le|les) (doy|pongo)|cuanto (le|les) doy|que tomo)\b/;
-  const contextoClinico = (aves.test(texto) && (lesiones.test(texto) || enfermedad.test(texto))) ||
-    (aves.test(anterior) && (lesiones.test(anterior) || enfermedad.test(anterior)));
-  const esUrgente = alarma.test(texto) && (aves.test(texto) || contextoClinico);
-  if ((esUrgente || indicaMedicamento.test(texto)) && contextoClinico) {
-    const prioridad = esUrgente ? 'Contacta cuanto antes a un médico veterinario que atienda aves. Lo que describes requiere valoración pronta.' :
-      'Para este caso, consulta a un médico veterinario que atienda aves y pueda decidir si hace falta un tratamiento.';
-    return {
-      texto: prioridad + ' Evita administrar medicamentos sin valoración. Ten a mano la edad de las aves, cuántas están afectadas, desde cuándo y qué otros signos observaste.',
-      reformular: false,
-      fuentes: FUENTES_ALERTA_AVES
-    };
-  }
-
-  const continuacionClinica = /\b(tienen|tiene|salen|empezaron|empezo|comen|respir\w*|murio|murieron|semanas?)\b/.test(texto);
-  const retomaLesiones = aves.test(anterior) && lesiones.test(anterior) && continuacionClinica &&
-    !/\b(certific\w*|clase\w*|receta\w*|material\w*)\b/.test(texto);
-  if ((aves.test(texto) && lesiones.test(texto)) || retomaLesiones) {
-    const detalle = retomaLesiones ? 'Para entender lo que observas en las aves, todavía hace falta una valoración.' :
-      'La descripción de esas marcas en las aves no alcanza por sí sola para saber qué las causó.';
-    return {
-      texto: detalle + ' ¿Qué edad tienen, cuántos de la parvada están afectados, en qué parte del cuerpo aparecieron y qué otros síntomas has notado?\n\nSi les cuesta respirar, dejan de comer o hay muertes, contacta cuanto antes a un médico veterinario que atienda aves. No les des medicamentos sin valoración.',
-      reformular: false,
-      fuentes: FUENTES_ALERTA_AVES
-    };
-  }
+  const salud = orientarAves(texto, historialNormalizado);
+  if (salud) return salud;
 
   const certificado = /\b([cs]ertif\w*|constancia|diploma)\b/;
   const retraso = /\b(cuando|cuanto tarda|cuanto tiempo|cuanto demoran|fecha|plazo|lleg\w*|tard\w*)\b/;

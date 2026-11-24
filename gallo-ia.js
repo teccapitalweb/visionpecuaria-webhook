@@ -1,4 +1,5 @@
 const { orientacionBase } = require('./gallo-orientacion');
+const { consultarBiblioteca } = require('./gallo-biblioteca');
 
 const CURSOS = {
   'gallinas-de-postura': {
@@ -137,13 +138,13 @@ function fichaDeClases(curso, ficha, consulta, texto, anteriores) {
 }
 
 const AYUDA = {
-  veterinaria: 'Si alguna ave presenta síntomas, consulta a un médico veterinario que pueda revisar a la parvada. Puedo señalarte el módulo de Sanidad y Bioseguridad de Gallinas para repasar prevención. ¿Buscas esa clase?',
+  veterinaria: 'Para elegir un tratamiento hace falta una valoración veterinaria de la especie y del caso. Evita dar medicamentos por tu cuenta. ¿Qué animal es, qué edad tiene y qué signos estás viendo?',
   certificado: 'Abre Mi certificado en el menú del curso. En el teléfono, toca Cuenta y después Ir a mi certificado o Ver certificado. Ahí puedes solicitarlo, consultar su estado y abrirlo cuando esté listo. Para corregir datos de una solicitud enviada, contacta a Soporte de Visión Pecuaria.',
   regalo: 'Revisa Mis cursos en el Aula. Cuando el acceso al regalo de Sexaje Avícola queda activado, aparece como un curso independiente con sus clases y materiales. Si usaste otro correo o el regalo no aparece después de confirmarse el pago, usa Soporte WhatsApp desde el panel.',
   contrasena: 'En la pantalla de acceso, elige Olvidé mi contraseña e indica el mismo correo con el que hiciste la compra. Revisa también spam. Si entraste con Google, vuelve a usar Continuar con Google con esa misma cuenta.',
   video: 'Vuelve a abrir la clase desde Clases y recarga la página. Si la grabación aparece pendiente, todavía no está publicada. Si un video publicado sigue sin abrir, prueba con otra conexión o envía a soporte el nombre de la clase y una captura del error.',
   pago: 'Si ya pagaste, entra al aula con el mismo correo que usaste en Stripe. Si el pago sigue pendiente, espera la confirmación del medio de pago. Para revisar un cobro, factura o devolución, usa Soporte WhatsApp desde el panel. Comparte tu comprobante solo por el canal oficial y evita enviar datos de tu tarjeta.',
-  precio: 'El precio vigente y el total se confirman antes de pagar. Si compraste Gallinas de Postura, revisa la recomendación de Embutidos debajo de Clases. Al entrar desde ahí con el mismo correo, el sistema comprueba si tienes el descuento y te muestra el total.',
+  precio: 'Si compraste Gallinas de Postura o Embutidos, abre Clases y revisa la recomendación del otro curso. La tarjeta muestra el precio de alumno cuando tu cuenta cumple los requisitos. Abre el enlace con el mismo correo con el que hiciste la compra para conservar el beneficio al pagar.',
   materiales: 'Entra a Materiales dentro de tu curso y abre la tarjeta del archivo. Puedes leerlo dentro del visor y usar Descargar para guardarlo. Si ves un error, intenta abrirlo otra vez desde Materiales y avisa a soporte si persiste.',
   acceso: 'Entra desde la página del curso con Ya compré o abre el Aula. Usa el mismo correo con el que pagaste y verifica que sea la cuenta correcta. Si la compra está confirmada y no aparece, contacta a Soporte desde el panel.',
   progreso: 'Abre Clases y elige una grabación. Puedes retomar tu curso desde Inicio y marcar como vista una clase que ya terminaste. El avance se guarda por separado en cada curso.',
@@ -158,6 +159,11 @@ function armarRespuesta(cursoActual, mensaje, historial, ficha) {
   const curso = CURSOS[slug];
   const orientacion = orientacionBase(texto, slug, anteriores);
   if (orientacion) return orientacion;
+  const pideContenidoAula = /\b(?:que dicen de|que se estudia|que incluye el curso|en que (?:clase|modulo|video) (?!de\b)|temario|donde veo (?:mis|las) clases|descarg\w*|[cs]ertif\w*|entra\w* al aula|stripe|ya pague)\b/.test(texto);
+  if (!pideContenidoAula) {
+    const consulta = consultarBiblioteca(texto, anteriores);
+    if (consulta) return consulta;
+  }
   let tema = intencion(texto);
   let unidad = unidadMencionada(texto, curso);
   const seguimiento = /^(y |entonces |tambien |donde\b|como\b|cuanto\b|en que\b|que hago\b)/.test(texto) && texto.split(' ').length <= 12;
@@ -198,10 +204,13 @@ function armarRespuesta(cursoActual, mensaje, historial, ficha) {
   }
 
   if (/^(hola|buenos dias|buenas tardes|buenas noches|buenas|que tal|hey)( (mi )?gallo( ia)?)?$/.test(texto)) {
-    return { texto: '¡Hola! Soy tu Gallo IA. Puedo ayudarte a repasar ' + curso.nombre + ', ubicar tus clases y materiales o resolver dudas sobre el aula. ¿Qué te gustaría revisar?', reformular: false };
+    return { texto: '¡Hola! Soy tu Gallo IA. Puedo orientarte sobre cría, alimentación y manejo de aves, y ayudarte con ' + curso.nombre + '. ¿Qué quieres revisar?', reformular: false };
   }
   if (/^(muchas )?gracias( .*)?$/.test(texto)) {
     return { texto: '¡De nada! Si quieres, seguimos con otra clase o con una duda sobre el aula.', reformular: false };
+  }
+  if (/\b(?:pollit\w*|pollos?|polluel\w*|gallinas?|aves?|parvada|ponedoras?)\b/.test(texto) && !pideContenidoAula) {
+    return { texto: 'Cuéntame qué estás observando en tus aves. Para ubicar tu consulta, dime la edad aproximada y si se trata de alimentación, alojamiento, postura o algún cambio de salud. ¿Qué pasó y desde cuándo?', reformular: false };
   }
   if (cursoMencionado(texto)) {
     return { texto: `Puedo orientarte sobre ${curso.nombre}. ¿Buscas su temario, una clase específica o ayuda para entrar a sus materiales?`, reformular: false };
