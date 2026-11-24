@@ -23,6 +23,8 @@ const users = {
   tRevocado:   { uid: 'u-rev', email: 'rev@gmail.com', email_verified: true },
   tDos:        { uid: 'u-dos', email: 'dos@gmail.com', email_verified: true },
   tAdmin:      { uid: 'u-admin', email: 'admin@visionpecuariamx.com', email_verified: true },
+  tAdminClub:  { uid: 'u-admin-club', email: 'club@example.org', email_verified: true, admin: true },
+  tAdminClubRevocado: { uid: 'u-admin-club-revocado', admin: true, tokenRevocado: true },
   tPend:       { uid: 'u-pend', email: 'oxxo@gmail.com', email_verified: true },
   tDestino:    { uid: 'u-dest', email: 'nuevo@gmail.com', email_verified: true }
 };
@@ -482,6 +484,109 @@ test('se atribuye la oferta inversa sin descuento y la lista de compras sólo es
   const resumen = await api(`/admin/cursos/promociones/metricas?origenSlug=${origenSlug}&destinoSlug=${destinoSlug}`, { token: 'tAdmin' });
   assert.equal(resumen.data.totales.checkout_creado.eventos, 1);
   assert.equal(resumen.data.totales.checkout_montado.eventos, 1);
+});
+
+test('visitas y dispositivos comparan cursos sin duplicar recargas del mismo evento', async () => {
+  await db.collection('cursosVenta').doc('curso-nuevo').set({ medirActividad: true, ventaDirecta: true });
+  await db.collection('cursosVenta').doc('sexaje-avicola').set({ medirActividad: true, ventaDirecta: true }, { merge: true });
+  const visitaId = crypto.randomUUID();
+  const origenSlug = 'embutidos-artesanales';
+  const destinoSlug = 'gallinas-de-postura';
+  const evento = { visitaId, origenSlug, destinoSlug, eventoId: crypto.randomUUID(), dispositivo: 'telefono' };
+  const guardar = (body, token) => api('/publico/cursos/actividad', { method: 'POST', body, token });
+  assert.equal((await guardar({ ...evento, tipo: 'pagina_visitada' })).status, 204);
+  assert.equal((await guardar({ ...evento, tipo: 'pagina_visitada', eventoId: crypto.randomUUID() })).status, 204);
+  assert.equal((await guardar({ ...evento, tipo: 'pagina_tiempo', dispositivo: 'tableta', duracionSeg: 4 })).status, 204);
+  assert.equal((await guardar({ ...evento, tipo: 'pagina_visitada', dispositivo: 'Firefox' })).status, 400);
+  assert.equal((await guardar({ ...evento, destinoSlug: 'sexaje-avicola', origenSlug: null, tipo: 'pagina_visitada' })).status, 400);
+  assert.equal((await guardar({ ...evento, destinoSlug: 'curso-nuevo', origenSlug: null, tipo: 'pagina_visitada', dispositivo: 'computadora' }, 'tGallinas')).status, 204);
+
+  const path = '/admin/cursos/promociones/metricas?dias=7';
+  assert.equal((await api(path, { token: 'tGallinas' })).status, 403);
+  assert.equal((await api(path, { token: 'tAdminClubRevocado' })).status, 401);
+  assert.equal((await api('/admin/cursos/compras', { token: 'tAdminClub' })).status, 403);
+  const { data, status } = await api(path, { token: 'tAdminClub' });
+  assert.equal(status, 200);
+  assert.equal(data.serie.length, 7);
+  assert.equal(data.totales.pagina_visitada.eventos, 2);
+  assert.equal(data.totales.pagina_visitada.anonimos, 1);
+  assert.equal(data.totales.pagina_visitada.cuentasVerificadas, 1);
+  assert.equal(data.porCurso.find(x => x.slug === destinoSlug).totales.pagina_visitada.eventos, 1);
+  assert.equal(data.porCurso.find(x => x.slug === 'curso-nuevo').totales.pagina_visitada.eventos, 1);
+  assert.equal(data.dispositivos.find(x => x.dispositivo === 'telefono').totales.pagina_tiempo.duracionSeg, 4);
+  assert.equal(data.dispositivos.find(x => x.dispositivo === 'tableta').totales.pagina_tiempo.duracionSeg, 0);
+  assert.ok(!JSON.stringify(data).includes(visitaId));
+  const promo = await api(path + '&origenSlug=' + origenSlug + '&destinoSlug=' + destinoSlug, { token: 'tAdmin' });
+  assert.equal(promo.data.totales.pagina_visitada.eventos, 1);
+  assert.ok(promo.data.personas.some(p => p.identidad === 'visita_anonima' && p.dispositivos.includes('telefono')));
+});
+
+test('solo el pago firmado y abonado entra al embudo, incluso con pago diferido y reenvíos', async () => {
+  const origenSlug = 'gallinas-de-postura', destinoSlug = 'embutidos-artesanales';
+  const visitaId = crypto.randomUUID();
+  const compra = await api('/crear-checkout-curso', {
+    method: 'POST', token: 'tGallinas', body: { slug: destinoSlug, origenSlug, visitaId, dispositivo: 'telefono' }
+  });
+  assert.equal(compra.status, 200, JSON.stringify(compra.data));
+  const sessionId = compra.data.sessionId;
+  const metrica = '/admin/cursos/promociones/metricas?origenSlug=' + origenSlug + '&destinoSlug=' + destinoSlug;
+  const datos = { visitaId, origenSlug, destinoSlug };
+  const actividad = (body) => api('/publico/cursos/actividad', { method: 'POST', body: { ...datos, ...body } });
+  assert.equal((await actividad({ tipo: 'checkout_montado', sessionId, dispositivo: 'tableta' })).status, 204);
+  assert.equal((await actividad({ tipo: 'compra_pagada', eventoId: crypto.randomUUID() })).status, 400);
+
+  const creado = Math.floor(Date.now() / 1000) - 20;
+  const confirmado = creado + 10;
+  const session = {
+    id: sessionId, created: creado, amount_total: 45000, currency: 'mxn', payment_status: 'unpaid',
+    metadata: stripeMock.checkoutCreados.at(-1).metadata,
+    customer_details: { email: users.tGallinas.email, name: 'Comprador' }
+  };
+  const evento = (type, created, object) => ({ id: 'evt_metricas_' + type, type, created, data: { object } });
+  assert.equal(await webhook(evento('checkout.session.completed', creado, session)), 200);
+  let informe = (await api(metrica, { token: 'tAdmin' })).data;
+  assert.equal(informe.totales.compra_pagada.eventos, 0);
+  assert.equal(informe.embudo.checkoutsMontadosSinConfirmar, 1);
+
+  const abonada = { ...session, payment_status: 'paid' };
+  const diferido = evento('checkout.session.async_payment_succeeded', confirmado, abonada);
+  assert.equal(await webhook(diferido), 200);
+  assert.equal(await webhook({ ...diferido, created: confirmado + 1 }), 200);
+  informe = (await api(metrica, { token: 'tAdmin' })).data;
+  assert.equal(informe.totales.compra_pagada.eventos, 1);
+  assert.equal(informe.totales.compra_pagada.cuentasVerificadas, 1);
+  assert.equal(informe.embudo.checkoutsMontadosPagados, 1);
+  assert.equal(informe.embudo.checkoutsMontadosSinConfirmar, 0);
+  assert.equal(informe.dispositivos.find(x => x.dispositivo === 'telefono').totales.compra_pagada.eventos, 1);
+  assert.equal(informe.dispositivos.find(x => x.dispositivo === 'tableta').totales.checkout_montado.eventos, 0);
+  assert.ok(!JSON.stringify(informe).includes(sessionId));
+  assert.ok(!JSON.stringify(informe).includes('checkoutRef'));
+  const fila = (await api('/admin/cursos/compras?slug=' + destinoSlug, { token: 'tAdmin' })).data.compras.find(p => p.sessionId === sessionId);
+  assert.equal(fila.confirmadoEn, new Date(confirmado * 1000).toISOString());
+  assert.equal(fila.promoOrigenSlug, origenSlug);
+  assert.equal(fila.promoDescuentoCentavos, 10000);
+  assert.equal(fila.dispositivo, 'telefono');
+  assert.equal(fila.moneda, 'mxn');
+
+  const sinVisita = {
+    ...abonada, id: 'cs_sin_visita_metricas',
+    metadata: { tipo: 'curso', slug: destinoSlug, uid: 'u-legado' },
+    customer_details: { email: 'sin-visita@example.org', name: 'Compra común' }
+  };
+  assert.equal(await webhook(evento('checkout.session.completed', confirmado, sinVisita)), 200);
+  assert.equal(await webhook(evento('checkout.session.completed', confirmado, {
+    ...sinVisita, id: 'cs_regalo_metricas', amount_total: 0, payment_status: 'no_payment_required',
+    metadata: { tipo: 'curso', slug: 'sexaje-avicola', uid: 'u-regalo' }
+  })), 200);
+  const sinAtribucion = '/admin/cursos/promociones/metricas?origenSlug=sin_atribucion&destinoSlug=' + destinoSlug;
+  const noAtribuidas = (await api(sinAtribucion, { token: 'tAdmin' })).data;
+  const pago = noAtribuidas.eventos.find(e => e.email === 'sin-visita@example.org' && e.tipo === 'compra_pagada');
+  assert.equal(pago.identidad, 'comprador_stripe');
+  assert.equal(pago.dispositivo, 'desconocido');
+  assert.notEqual(pago.uid, 'u-legado');
+  assert.equal(noAtribuidas.embudo.checkoutsPagados, 0);
+  const todos = (await api('/admin/cursos/promociones/metricas', { token: 'tAdmin' })).data;
+  assert.ok(!todos.porCurso.some(c => c.slug === 'sexaje-avicola'));
 });
 
 // ─── Bunny + solicitudes de certificado ─────────────────────────────────────

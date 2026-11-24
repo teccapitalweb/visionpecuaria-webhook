@@ -2,8 +2,11 @@ const express = require('express');
 const admin = require('firebase-admin');
 const Stripe = require('stripe');
 const { regaloVigente, aplicarRegalo } = require('./regalos');
-const { obtenerOfertaPromocional, precioVigenteCentavos } = require('./promociones-cursos');
-const { guardarEventoPromo, registrarCheckoutActividad, normalizarVisitaId, atribucionValida } = require('./promocion-analytics');
+const { obtenerOfertaPromocional, precioVigenteCentavos, OFERTAS_PROMOCIONALES } = require('./promociones-cursos');
+const {
+  guardarEventoPromo, registrarCheckoutActividad, registrarCompraPagada,
+  normalizarVisitaId, atribucionValida, dispositivoCheckout
+} = require('./promocion-analytics');
 
 const app = express();
 
@@ -435,7 +438,7 @@ app.post('/crear-checkout-curso', async (req, res) => {
   try {
     const {
       slug: slugRaw, uid: uidRaw, email: emailRaw, nombre: nombreRaw, whatsapp: whatsappRaw,
-      origenSlug: origenRaw, atribucionOrigen, visitaId: visitaRaw
+      origenSlug: origenRaw, atribucionOrigen, visitaId: visitaRaw, dispositivo
     } = req.body || {};
 
     const slug = sanearTexto(slugRaw);
@@ -535,17 +538,17 @@ app.post('/crear-checkout-curso', async (req, res) => {
 
     try {
       const visitaId = normalizarVisitaId(visitaRaw);
-      const origenActividad = oferta ? origenSlug : (atribucionValida(atribucionOrigen, slug) ? atribucionOrigen : null);
-      if (visitaId && atribucionValida(origenActividad, slug)) {
+      const origenActividad = oferta ? origenSlug : ((await atribucionValida(db, atribucionOrigen, slug)) ? atribucionOrigen : null);
+      if (visitaId && await atribucionValida(db, origenActividad, slug)) {
         const cabecera = req.get('authorization') || '';
         const usuario = usuarioOferta || (cabecera.startsWith('Bearer ')
           ? await auth.verifyIdToken(cabecera.slice(7).trim()).catch(() => null)
           : null);
         await registrarCheckoutActividad(db, {
-          origenSlug: origenActividad, destinoSlug: slug, visitaId, usuario, sessionId: session.id
+          origenSlug: origenActividad, destinoSlug: slug, visitaId, usuario, sessionId: session.id, dispositivo
         });
       } else if (oferta) {
-        await guardarEventoPromo(db, { origenSlug, destinoSlug: slug, tipo: 'checkout_creado', eventoId: session.id, uid, email, nombre });
+        await guardarEventoPromo(db, { origenSlug, destinoSlug: slug, tipo: 'checkout_creado', eventoId: session.id, uid, email, nombre, dispositivo });
       }
     } catch (err) {
       console.warn('No se pudo registrar el checkout del curso:', err.code || err.name);
@@ -699,7 +702,7 @@ app.get('/verificar-session-curso', async (req, res) => {
 //   · Un candado por sessionId evita duplicar pagos, cupos, certificados
 //     pendientes y correos cuando Stripe reenvía el evento.
 // ═════════════════════════════════════════════════════════════════════════════
-async function procesarCompraCurso(session) {
+async function procesarCompraCurso(session, fechaConfirmacion) {
   const pagado = session.payment_status === 'paid' || session.payment_status === 'no_payment_required';
   if (!pagado) {
     const ref = db.collection('comprasCurso').doc(session.id);
@@ -756,6 +759,15 @@ async function procesarCompraCurso(session) {
         : new Date().toISOString();
       const montoCentavos = session.amount_total || 0;
       const regalo = await regaloVigente(db, slug, fechaISO);
+      const moneda = /^[a-z]{3}$/i.test(session.currency || '') ? session.currency.toLowerCase() : 'mxn';
+      const promoOrigenSlug = session.metadata?.promoOrigenSlug;
+      const promoDescuentoCentavos = Number(session.metadata?.promoDescuentoCentavos);
+      const tienePromoConfirmada = OFERTAS_PROMOCIONALES.some(p => p.origenSlug === promoOrigenSlug && p.destinoSlug === slug) &&
+        Number.isSafeInteger(promoDescuentoCentavos) && promoDescuentoCentavos > 0;
+      const dispositivo = await dispositivoCheckout(db, session.id, slug).catch(err => {
+        console.warn('No se pudo consultar el dispositivo asociado al checkout:', err.code || err.name);
+        return 'desconocido';
+      });
       const compra = {
         sessionId: session.id,
         slug,
@@ -765,7 +777,11 @@ async function procesarCompraCurso(session) {
         whatsapp,
         estado: 'confirmado',
         fechaCompra: fechaISO,
+        confirmadoEn: fechaConfirmacion.toISOString(),
         montoPagadoCentavos: montoCentavos,
+        moneda,
+        dispositivo,
+        ...(tienePromoConfirmada ? { promoOrigenSlug, promoDescuentoCentavos } : {}),
         stripeCustomerId: session.customer || null,
         ...(regalo ? { regalo } : {})
       };
@@ -870,6 +886,16 @@ async function procesarCompraCurso(session) {
   }
 }
 
+async function procesarEventoCompraCurso(event) {
+  const session = event.data.object;
+  const segundos = Number(event.created);
+  const fechaStripe = Number.isSafeInteger(segundos) && segundos > 0 ? new Date(segundos * 1000) : null;
+  const confirmadoEn = fechaStripe && !Number.isNaN(fechaStripe.getTime()) ? fechaStripe : new Date();
+  await procesarCompraCurso(session, confirmadoEn);
+  try { await registrarCompraPagada(db, session, confirmadoEn); }
+  catch (err) { console.warn('No se pudo registrar la métrica del pago de curso:', err.code || err.name); }
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // 3) WEBHOOK STRIPE — actualizar Firestore cuando pasa algo
 // ═════════════════════════════════════════════════════════════════════════════
@@ -896,7 +922,7 @@ app.post('/stripe-webhook', async (req, res) => {
 
         // ── RAMA A: pago de CURSO individual (nuevo) ──
         if (tipo === 'curso') {
-          await procesarCompraCurso(session);
+          await procesarEventoCompraCurso(event);
           break;
         }
 
@@ -981,7 +1007,7 @@ app.post('/stripe-webhook', async (req, res) => {
       // ─── Pagos diferidos (OXXO, etc.) de cursos ─────────────────────────────
       case 'checkout.session.async_payment_succeeded': {
         const session = event.data.object;
-        if (session.metadata?.tipo === 'curso') await procesarCompraCurso(session);
+        if (session.metadata?.tipo === 'curso') await procesarEventoCompraCurso(event);
         break;
       }
 
