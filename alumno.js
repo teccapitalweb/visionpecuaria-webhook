@@ -19,6 +19,7 @@
 // ═════════════════════════════════════════════════════════════════════════════
 const crypto = require('crypto');
 const { claveEntradaValida, uidDePago } = require('./entrada-checkout');
+const { pixelPurchaseEventId } = require('./meta-conversions');
 const { regaloParaPago, aplicarRegalo } = require('./regalos');
 const { registrarMetricasPromocion } = require('./promocion-analytics');
 const { registrarGalloIA } = require('./gallo-ia');
@@ -360,7 +361,8 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
       const email = String((s.customer_details && s.customer_details.email) || s.customer_email || meta.email || '').toLowerCase().trim();
       const base = {
         ok: true, pagado: true, slug, monto: typeof s.amount_total === 'number' ? s.amount_total / 100 : null,
-        moneda: typeof s.currency === 'string' && /^[a-z]{3}$/i.test(s.currency) ? s.currency.toUpperCase() : null
+        moneda: typeof s.currency === 'string' && /^[a-z]{3}$/i.test(s.currency) ? s.currency.toUpperCase() : null,
+        pixelPurchaseEventId: pixelPurchaseEventId(sessionId)
       };
       if (!email) return res.json({ ...base, entrada: 'manual' });
 
