@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const Module = require('module');
 const crypto = require('crypto');
 const { FakeDB, fakeAuth, fakeStripe, fakeAdmin } = require('./fakes');
+const { nuevaClaveEntrada, uidDePago } = require('../entrada-checkout');
 const { apartarRegalo, metadataRegaloCheckout } = require('../regalos');
 
 const PORT = 38000 + Math.floor(Math.random() * 1000);
@@ -106,10 +107,13 @@ async function semilla() {
   s('comprasCurso/cs_pend', { sessionId: 'cs_pend', slug: 'gallinas-de-postura', email: 'oxxo@gmail.com', estado: 'pendiente' });
 }
 
-async function api(path, { token, method = 'GET', body } = {}) {
+async function api(path, { token, method = 'GET', body, origin } = {}) {
   const r = await fetch(BASE + path, {
     method,
-    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
+    headers: {
+      'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}),
+      ...(origin ? { Origin: origin } : {})
+    },
     body: body ? JSON.stringify(body) : undefined
   });
   let data = null; try { data = await r.json(); } catch (_) {}
@@ -799,37 +803,98 @@ test('materiales: descripción, categoría y tipo pptx llegan al alumno', async 
   assert.ok(!JSON.stringify(det.data.materiales).includes('Modulo_02_Nutricion.pptx'));
 });
 
-test('entrar por pago: cuenta nueva recibe token de un solo uso; pagos sin confirmar, viejos o ajenos no', async () => {
-  const P = (sessionId) => api('/alumno/entrar-por-pago', { method: 'POST', body: { sessionId, esperaMs: 0 } });
+test('checkout: la clave de entrada no va en la URL y el retorno conserva el origen del aula', async () => {
+  for (const [slug, origin] of [
+    ['embutidos-artesanales', 'https://www.visionpecuariamx.com'],
+    ['gallinas-de-postura', 'https://visionpecuariamx.com'],
+    ['embutidos-artesanales', 'https://otro-sitio.example']
+  ]) {
+    const r = await api('/crear-checkout-curso', { method: 'POST', body: { slug }, origin });
+    assert.equal(r.status, 200);
+    assert.match(r.data.claveEntrada, /^[a-f0-9]{64}$/);
+    const checkout = stripeMock.checkoutCreados.at(-1);
+    assert.equal(checkout.metadata.huellaEntrada, crypto.createHash('sha256').update(r.data.claveEntrada).digest('hex'));
+    assert.equal(JSON.stringify(checkout).includes(r.data.claveEntrada), false);
+    const esperado = origin.endsWith('.example') ? process.env.SITIO_URL || 'https://visionpecuariamx.com' : origin;
+    assert.equal(checkout.return_url, `${esperado}/${slug}.html?pago=ok&session_id={CHECKOUT_SESSION_ID}`);
+  }
+});
+
+test('entrar por pago: sólo el navegador del checkout obtiene acceso de invitado a esa compra y su regalo', async () => {
+  const P = (sessionId, claveEntrada) => api('/alumno/entrar-por-pago', { method: 'POST', body: { sessionId, claveEntrada, esperaMs: 0 } });
+  const { claveEntrada, huellaEntrada } = nuevaClaveEntrada();
+  stripeSessions.cs_nuevo.metadata.huellaEntrada = huellaEntrada;
+  stripeSessions.cs_nuevo.currency = 'mxn';
+  stripeSessions.cs_viejo_pago.metadata.huellaEntrada = huellaEntrada;
   assert.equal((await P('basura')).status, 400);
   assert.equal((await P('cs_no_existe_123')).status, 404);
   assert.equal((await P('cs_membresia')).status, 404);
   const sp = await P('cs_sin_pagar');
   assert.equal(sp.status, 409); assert.equal(sp.data.pendiente, true);
 
-  const r = await P('cs_nuevo');
+  assert.equal((await P('cs_nuevo')).data.entrada, 'manual');
+  assert.equal((await P('cs_nuevo', nuevaClaveEntrada().claveEntrada)).data.entrada, 'manual');
+  assert.equal((await P('cs_nuevo', claveEntrada)).status, 409);
+  db.data.set('comprasCurso/cs_nuevo', {
+    slug: 'embutidos-artesanales', estado: 'confirmado', regalo: 'sexaje-avicola', email: 'recien@gmail.com'
+  });
+  db.data.set('comprasCurso/cs_otro_recien', {
+    slug: 'gallinas-de-postura', estado: 'confirmado', email: 'recien@gmail.com'
+  });
+  const r = await P('cs_nuevo', claveEntrada);
   assert.equal(r.status, 200);
   assert.equal(r.data.entrada, 'token');
   assert.equal(r.data.slug, 'embutidos-artesanales');
   assert.equal(r.data.monto, 550);
-  assert.match(r.data.token, /^custom-nuevo-/);
-  assert.equal(db._get('entradasPorPago/cs_nuevo').email, 'recien@gmail.com');
-  // El mismo enlace no vuelve a dar token (ni porque ya se usó ni porque la cuenta ya existe)
+  assert.equal(r.data.moneda, 'MXN');
+  assert.equal(r.data.regalo, 'sexaje-avicola');
+  const uid = uidDePago('cs_nuevo');
+  assert.equal(r.data.token, 'custom-' + uid);
+  assert.equal(db._get('entradasPorPago/cs_nuevo').email, undefined);
+  assert.equal(Object.values(users).some(user => user.email === 'recien@gmail.com'), false);
+  assert.equal(db._get(`accesosCurso/${uid}/cursos/embutidos-artesanales`).activo, true);
+  assert.equal(db._get(`accesosCurso/${uid}/cursos/sexaje-avicola`).origen, 'regalo');
+  users.tInvitado = { uid };
+  const derechos = await api('/alumno/estado', { token: 'tInvitado' });
+  assert.equal(derechos.status, 200);
+  assert.equal(derechos.data.usuario.verificado, false);
+  assert.equal(derechos.data.cursos.some(curso => curso.slug === 'gallinas-de-postura'), false);
+  const mismaSesion = await api('/alumno/entrar-por-pago', {
+    method: 'POST', token: 'tInvitado', body: { sessionId: 'cs_nuevo', claveEntrada, esperaMs: 0 }
+  });
+  assert.equal(mismaSesion.data.entrada, 'sesion');
+  assert.equal(mismaSesion.data.token, undefined);
   const r2 = await P('cs_nuevo');
-  assert.equal(r2.data.entrada, 'manual'); assert.equal(r2.data.token, undefined); assert.equal(r2.data.cuentaExistente, true);
-  // Pago de hace 2 h: confirmado, pero sin entrada automática
-  const v = await P('cs_viejo_pago');
+  assert.equal(r2.data.entrada, 'manual');
+  assert.equal(r2.data.token, undefined);
+  assert.equal((await P('cs_nuevo', claveEntrada)).data.token, r.data.token);
+  const v = await P('cs_viejo_pago', claveEntrada);
   assert.equal(v.data.entrada, 'manual'); assert.equal(v.data.token, undefined);
+
+  const acceso = db._get(`accesosCurso/${uid}/cursos/embutidos-artesanales`);
+  db.data.set(`accesosCurso/${uid}/cursos/embutidos-artesanales`, { ...acceso, activo: false, estado: 'inactivo', revocado: true });
+  assert.equal((await P('cs_nuevo', claveEntrada)).data.entrada, 'manual');
 });
 
-test('entrar por pago: pagar con el correo de una cuenta que ya existe NO entrega su sesión', async () => {
-  const r = await api('/alumno/entrar-por-pago', { method: 'POST', body: { sessionId: 'cs_de_otro', esperaMs: 0 } });
+test('entrar por pago: una cuenta existente requiere su propia sesión verificada', async () => {
+  const { claveEntrada, huellaEntrada } = nuevaClaveEntrada();
+  stripeSessions.cs_de_otro.metadata.huellaEntrada = huellaEntrada;
+  db.data.set('comprasCurso/cs_de_otro', {
+    slug: 'embutidos-artesanales', estado: 'confirmado', email: 'comprador@gmail.com'
+  });
+  const probar = (token) => api('/alumno/entrar-por-pago', {
+    method: 'POST', token, body: { sessionId: 'cs_de_otro', claveEntrada, esperaMs: 0 }
+  });
+  const r = await probar('tOtro');
   assert.equal(r.status, 200);
   assert.equal(r.data.pagado, true);
   assert.equal(r.data.entrada, 'manual');
-  assert.equal(r.data.cuentaExistente, true);
   assert.equal(r.data.token, undefined);
   assert.equal(db._get('entradasPorPago/cs_de_otro'), undefined);
+  assert.equal((await probar('tSinVerif')).data.entrada, 'manual');
+  const autorizado = await probar('tGallinas');
+  assert.equal(autorizado.data.entrada, 'sesion');
+  assert.equal(autorizado.data.token, undefined);
 });
 
 test('checkout y webhook de Sexaje honran la reserva del navegador y la hora real del pago', async () => {

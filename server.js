@@ -2,6 +2,7 @@ const express = require('express');
 const admin = require('firebase-admin');
 const Stripe = require('stripe');
 const { metadataMetaCheckout, reportarCompraMeta } = require('./meta-conversions');
+const { nuevaClaveEntrada } = require('./entrada-checkout');
 const { apartarRegalo, prepararRegaloCheckout, regaloParaPago, aplicarRegalo } = require('./regalos');
 const { obtenerOfertaPromocional, precioVigenteCentavos, OFERTAS_PROMOCIONALES } = require('./promociones-cursos');
 const {
@@ -34,6 +35,7 @@ const AULA_EN_LANDING = {
   'gallinas-de-postura': '/gallinas-de-postura.html',
   'embutidos-artesanales': '/embutidos-artesanales.html'
 };
+const ORIGENES_LANDINGS = new Set(['https://visionpecuariamx.com', 'https://www.visionpecuariamx.com']);
 
 // ─── Resend (envío de correos) ───────────────────────────────────────────────
 // La API key vive en Railway como RESEND_API_KEY.
@@ -467,7 +469,6 @@ app.post('/crear-checkout-curso', async (req, res) => {
     let oferta;
     let usuarioOferta;
     if (origenSlug) {
-      res.setHeader('Cache-Control', 'private, no-store');
       const usuario = await autenticarSolicitud(req, res);
       if (!usuario) return;
       try { oferta = await obtenerOfertaPromocional(db, usuario, origenSlug, slug); }
@@ -517,6 +518,10 @@ app.post('/crear-checkout-curso', async (req, res) => {
 
     // 4) Crear Stripe Checkout Session (modo payment, no subscription)
     const nombreCurso = curso.nombre || curso.titulo || 'Curso Visión Pecuaria';
+    const origenPeticion = req.get('origin');
+    const origenRetorno = ORIGENES_LANDINGS.has(origenPeticion) ? origenPeticion : SITIO_URL;
+    const rutaAula = Object.hasOwn(AULA_EN_LANDING, slug) ? AULA_EN_LANDING[slug] : null;
+    const { claveEntrada, huellaEntrada } = rutaAula ? nuevaClaveEntrada() : {};
     // Stripe fija el correo al usar un Customer con email. Un prellenado por sí solo se puede editar.
     const clientePromo = oferta ? await stripe.customers.create({ email, ...(nombre ? { name: nombre } : {}), metadata: { uid } }) : null;
     const regalo = await prepararRegaloCheckout(db, {
@@ -541,6 +546,7 @@ app.post('/crear-checkout-curso', async (req, res) => {
       allow_promotion_codes: !oferta,
       metadata: {
         tipo: 'curso',
+        ...(huellaEntrada ? { huellaEntrada } : {}),
         slug,
         uid,
         nombre,
@@ -551,8 +557,8 @@ app.post('/crear-checkout-curso', async (req, res) => {
         ...(oferta ? { promoOrigenSlug: origenSlug, promoDescuentoCentavos: String(oferta.descuentoCentavos) } : {})
       },
       // Gallinas y Embutidos tienen el aula dentro de su propia landing: al pagar se vuelve ahí y se entra directo.
-      return_url: AULA_EN_LANDING[slug]
-        ? `${SITIO_URL}${AULA_EN_LANDING[slug]}?pago=ok&session_id={CHECKOUT_SESSION_ID}`
+      return_url: rutaAula
+        ? `${origenRetorno}${rutaAula}?pago=ok&session_id={CHECKOUT_SESSION_ID}`
         : `${SITIO_URL}/curso-acceso.html?slug=${encodeURIComponent(slug)}&session_id={CHECKOUT_SESSION_ID}`
     });
 
@@ -577,6 +583,7 @@ app.post('/crear-checkout-curso', async (req, res) => {
     res.json({
       clientSecret: session.client_secret,
       sessionId: session.id,
+      ...(claveEntrada ? { claveEntrada } : {}),
       ...(regalo.reservado ? { regaloReservado: regalo.reservado } : {}),
       ...(oferta ? { oferta } : {})
     });
