@@ -864,6 +864,12 @@ test('checkout y webhook de Sexaje honran la reserva del navegador y la hora rea
     assert.equal(pago.metadata.regaloSlug, undefined);
     assert.equal(pago.regaloReservado, undefined);
   }
+  const reclamo = await apartar({ cursoSlug, navegadorId, reclamar: true });
+  assert.equal(reclamo.status, 200);
+  assert.equal(reclamo.data.reclamada, true);
+  const recuperada = await crear({ navegadorId });
+  assert.equal(recuperada.metadata.regaloSlug, 'sexaje-avicola');
+  assert.equal(recuperada.regaloReservado.venceEn, reserva.data.venceEn);
 
   const emitida = Number(conReserva.metadata.regaloEmitidaEn);
   const vence = Number(conReserva.metadata.regaloVenceEn);
@@ -880,6 +886,16 @@ test('checkout y webhook de Sexaje honran la reserva del navegador y la hora rea
   assert.equal(await webhook(diferido), 200);
   assert.equal(db._get('comprasCurso/' + rDentro.id).regalo, 'sexaje-avicola');
   assert.equal(db._get('accesosCurso/' + sint(rDentro.customer_details.email) + '/cursos/sexaje-avicola').stripeSessionId, rDentro.id);
+
+  const desdeOtroBoton = sesion(recuperada, 'reserva-recuperada@example.org', 'paid');
+  assert.equal(await webhook(evento('checkout.session.completed', vence - 1, desdeOtroBoton)), 200);
+  assert.equal(db._get('comprasCurso/' + desdeOtroBoton.id).regalo, 'sexaje-avicola');
+  await db.collection('cursosVenta').doc('sexaje-avicola').set({ nombre: 'Sexaje Avícola' });
+  users.tRegaloRecuperado = { uid: 'u-regalo-recuperado', email: desdeOtroBoton.customer_details.email, email_verified: true };
+  const aula = await api('/alumno/estado', { token: 'tRegaloRecuperado' });
+  assert.equal(aula.status, 200);
+  assert.deepEqual(slugs(aula), [cursoSlug, 'sexaje-avicola']);
+  assert.equal(aula.data.cursos.find(curso => curso.slug === 'sexaje-avicola').origen, 'regalo');
 
   const rFuera = sesion(fuera, 'reserva-fuera@example.org', 'paid');
   assert.equal(await webhook(evento('checkout.session.async_payment_succeeded', vence, rFuera)), 200);

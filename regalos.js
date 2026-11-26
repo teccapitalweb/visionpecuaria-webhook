@@ -49,7 +49,12 @@ function ventanaValida(emitida, vence) {
   return Number.isSafeInteger(emitida) && emitida > 0 && Number.isSafeInteger(vence) && vence - emitida === VENTANA_SEG;
 }
 
-async function apartarRegalo(db, { cursoSlug, navegadorId, secretoWebhook, ahora = new Date() }) {
+function referenciaReserva(db, cursoSlug, navegador) {
+  const id = createHash('sha256').update(cursoSlug + ':' + navegador).digest('hex');
+  return db.collection('reservasRegalosCurso').doc(id);
+}
+
+async function apartarRegalo(db, { cursoSlug, navegadorId, secretoWebhook, reclamar = false, ahora = new Date() }) {
   const navegador = identificadorNavegador(navegadorId);
   if (typeof cursoSlug !== 'string' || !CURSOS_SEXAJE.has(cursoSlug) || !navegador) {
     throw errorReserva(400, 'Curso o navegador inválido para esta oferta.');
@@ -59,16 +64,23 @@ async function apartarRegalo(db, { cursoSlug, navegadorId, secretoWebhook, ahora
   if (await regaloVigente(db, cursoSlug, ahora.toISOString()) !== SEXAJE) {
     throw errorReserva(404, 'Este curso no tiene esta oferta en este momento.');
   }
-  const id = createHash('sha256').update(cursoSlug + ':' + navegador).digest('hex');
-  const ref = db.collection('reservasRegalosCurso').doc(id);
+  const ref = referenciaReserva(db, cursoSlug, navegador);
   const emitida = Math.floor(ahora.getTime() / 1000);
   const reserva = await db.runTransaction(async tx => {
     const snap = await tx.get(ref);
     if (snap.exists) {
       const anterior = snap.data();
       if (!ventanaValida(anterior.emitida, anterior.vence)) throw errorReserva(503, 'No pudimos recuperar la oferta.');
+      if (reclamar === true) {
+        if (emitida < anterior.emitida || emitida >= anterior.vence) throw errorReserva(409, 'Ya terminó la hora para apartar el regalo.');
+        if (anterior.reclamada !== true) {
+          tx.set(ref, { reclamada: true }, { merge: true });
+          return { ...anterior, reclamada: true };
+        }
+      }
       return anterior;
     }
+    if (reclamar === true) throw errorReserva(409, 'Primero abre la oferta del curso de regalo.');
     const nueva = { emitida, vence: emitida + VENTANA_SEG };
     tx.set(ref, nueva);
     return nueva;
@@ -80,7 +92,24 @@ async function apartarRegalo(db, { cursoSlug, navegadorId, secretoWebhook, ahora
     token: cuerpoToken + '.' + firmaRegalo(clave, cuerpoToken).toString('base64url'),
     venceEn: new Date(reserva.vence * 1000).toISOString(),
     ahora: ahora.toISOString(),
-    cursoRegaloSlug: SEXAJE
+    cursoRegaloSlug: SEXAJE,
+    reclamada: reserva.reclamada === true
+  };
+}
+
+function metadataDeReserva(reserva, ahora) {
+  const metadata = { regaloVersion: VERSION_VENTANA };
+  const ahoraSeg = ahora.getTime() / 1000;
+  if (!reserva || !ventanaValida(reserva.emitida, reserva.vence) || !Number.isFinite(ahoraSeg) ||
+      ahoraSeg < reserva.emitida || ahoraSeg >= reserva.vence) return { metadata };
+  return {
+    metadata: {
+      ...metadata,
+      regaloSlug: SEXAJE,
+      regaloEmitidaEn: String(reserva.emitida),
+      regaloVenceEn: String(reserva.vence)
+    },
+    reservado: { cursoRegaloSlug: SEXAJE, venceEn: new Date(reserva.vence * 1000).toISOString() }
   };
 }
 
@@ -97,18 +126,19 @@ function metadataRegaloCheckout({ cursoSlug, navegadorId, token, secretoWebhook,
   let reserva;
   try { reserva = JSON.parse(Buffer.from(cuerpo, 'base64url').toString('utf8')); }
   catch (_) { return base; }
-  const ahoraSeg = ahora.getTime() / 1000;
-  if (reserva?.cursoSlug !== cursoSlug || reserva.cursoRegaloSlug !== SEXAJE || reserva.navegador !== navegador ||
-      !ventanaValida(reserva.emitida, reserva.vence) || ahoraSeg < reserva.emitida || ahoraSeg >= reserva.vence) return base;
-  return {
-    metadata: {
-      ...base.metadata,
-      regaloSlug: SEXAJE,
-      regaloEmitidaEn: String(reserva.emitida),
-      regaloVenceEn: String(reserva.vence)
-    },
-    reservado: { cursoRegaloSlug: SEXAJE, venceEn: new Date(reserva.vence * 1000).toISOString() }
-  };
+  if (reserva?.cursoSlug !== cursoSlug || reserva.cursoRegaloSlug !== SEXAJE || reserva.navegador !== navegador) return base;
+  return metadataDeReserva(reserva, ahora);
+}
+
+async function prepararRegaloCheckout(db, datos) {
+  const { cursoSlug, navegadorId, ahora = new Date() } = datos;
+  const regalo = metadataRegaloCheckout({ ...datos, ahora });
+  if (regalo.reservado || !CURSOS_SEXAJE.has(cursoSlug)) return regalo;
+  const navegador = identificadorNavegador(navegadorId);
+  if (!navegador) return regalo;
+  const snap = await referenciaReserva(db, cursoSlug, navegador).get();
+  const reserva = snap.data();
+  return reserva?.reclamada === true ? metadataDeReserva(reserva, ahora) : regalo;
 }
 
 async function regaloParaPago(db, session, fechaConfirmacion) {
@@ -162,4 +192,4 @@ async function aplicarRegalo(db, uid, compra, { email = '', nombre = '' } = {}) 
   return { otorgado: true, slug };
 }
 
-module.exports = { regaloVigente, aplicarRegalo, apartarRegalo, metadataRegaloCheckout, regaloParaPago };
+module.exports = { regaloVigente, aplicarRegalo, apartarRegalo, metadataRegaloCheckout, prepararRegaloCheckout, regaloParaPago };

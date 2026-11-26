@@ -1,7 +1,7 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const Stripe = require('stripe');
-const { apartarRegalo, metadataRegaloCheckout, regaloParaPago, aplicarRegalo } = require('./regalos');
+const { apartarRegalo, prepararRegaloCheckout, regaloParaPago, aplicarRegalo } = require('./regalos');
 const { obtenerOfertaPromocional, precioVigenteCentavos, OFERTAS_PROMOCIONALES } = require('./promociones-cursos');
 const {
   guardarEventoPromo, registrarCheckoutActividad, registrarCompraPagada,
@@ -437,8 +437,8 @@ app.get('/alumno/promociones/cotizacion', async (req, res) => {
 app.post('/publico/cursos/regalo/apartar', async (req, res) => {
   res.setHeader('Cache-Control', 'private, no-store');
   try {
-    const { cursoSlug, navegadorId } = req.body || {};
-    const reserva = await apartarRegalo(db, { cursoSlug, navegadorId, secretoWebhook: STRIPE_WEBHOOK_SECRET });
+    const { cursoSlug, navegadorId, reclamar } = req.body || {};
+    const reserva = await apartarRegalo(db, { cursoSlug, navegadorId, reclamar, secretoWebhook: STRIPE_WEBHOOK_SECRET });
     res.json({ ...reserva, ahora: new Date().toISOString() });
   } catch (err) {
     if (err.status) return res.status(err.status).json({ error: err.message });
@@ -518,7 +518,7 @@ app.post('/crear-checkout-curso', async (req, res) => {
     const nombreCurso = curso.nombre || curso.titulo || 'Curso Visión Pecuaria';
     // Stripe fija el correo al usar un Customer con email. Un prellenado por sí solo se puede editar.
     const clientePromo = oferta ? await stripe.customers.create({ email, ...(nombre ? { name: nombre } : {}), metadata: { uid } }) : null;
-    const regalo = metadataRegaloCheckout({
+    const regalo = await prepararRegaloCheckout(db, {
       cursoSlug: slug, navegadorId, token: reservaRegalo, secretoWebhook: STRIPE_WEBHOOK_SECRET
     });
     const session = await stripe.checkout.sessions.create({

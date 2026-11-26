@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { randomUUID } = require('node:crypto');
 const { FakeDB } = require('./fakes');
-const { regaloVigente, aplicarRegalo, apartarRegalo, metadataRegaloCheckout, regaloParaPago } = require('../regalos');
+const { regaloVigente, aplicarRegalo, apartarRegalo, metadataRegaloCheckout, prepararRegaloCheckout, regaloParaPago } = require('../regalos');
 
 function dbConRegla() {
   const db = new FakeDB();
@@ -112,4 +112,30 @@ test('solo la confirmación dentro de la hora concede el regalo de las sesiones 
     ...session, metadata: { tipo: 'curso', slug: cursoSlug, regaloVersion: '2' }
   }, antes), null);
   assert.equal(await regaloParaPago(db, { ...session, metadata: { tipo: 'curso', slug: cursoSlug } }, antes), 'sexaje-avicola');
+});
+
+test('el checkout recupera la reserva reclamada del mismo navegador y del mismo curso', async () => {
+  const db = dbConRegla();
+  const cursoSlug = 'gallinas-de-postura';
+  const otroCurso = 'embutidos-artesanales';
+  db.data.set('cursosVenta/' + otroCurso, db._get('cursosVenta/' + cursoSlug));
+  const datos = { cursoSlug, navegadorId: randomUUID(), secretoWebhook: 'secreto-para-prueba-local', ahora: new Date('2026-11-23T12:00:00Z') };
+  const sinRegalo = { metadata: { regaloVersion: '2' } };
+
+  await assert.rejects(apartarRegalo(db, { ...datos, reclamar: true }), { status: 409 });
+  const oferta = await apartarRegalo(db, datos);
+  assert.equal(oferta.reclamada, false);
+  assert.deepEqual(await prepararRegaloCheckout(db, datos), sinRegalo);
+
+  const reclamada = await apartarRegalo(db, { ...datos, ahora: new Date('2026-11-23T12:30:00Z'), reclamar: true });
+  assert.equal(reclamada.reclamada, true);
+  assert.equal(reclamada.venceEn, oferta.venceEn);
+  assert.equal(reclamada.token, oferta.token);
+  const ahora = new Date('2026-11-23T12:59:59Z');
+  assert.deepEqual(await prepararRegaloCheckout(db, { ...datos, ahora }),
+    metadataRegaloCheckout({ ...datos, token: reclamada.token, ahora }));
+  assert.deepEqual(await prepararRegaloCheckout(db, { ...datos, ahora, navegadorId: randomUUID() }), sinRegalo);
+  assert.deepEqual(await prepararRegaloCheckout(db, { ...datos, ahora, cursoSlug: otroCurso }), sinRegalo);
+  assert.deepEqual(await prepararRegaloCheckout(db, { ...datos, ahora: new Date(oferta.venceEn) }), sinRegalo);
+  await assert.rejects(apartarRegalo(db, { ...datos, ahora: new Date(oferta.venceEn), reclamar: true }), { status: 409 });
 });
