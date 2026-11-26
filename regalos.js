@@ -137,8 +137,8 @@ async function prepararRegaloCheckout(db, datos) {
   const navegador = identificadorNavegador(navegadorId);
   if (!navegador) return regalo;
   const snap = await referenciaReserva(db, cursoSlug, navegador).get();
-  const reserva = snap.data();
-  return reserva?.reclamada === true ? metadataDeReserva(reserva, ahora) : regalo;
+  // El contador ya representa una ventana abierta para este navegador.
+  return metadataDeReserva(snap.data(), ahora);
 }
 
 async function regaloParaPago(db, session, fechaConfirmacion) {

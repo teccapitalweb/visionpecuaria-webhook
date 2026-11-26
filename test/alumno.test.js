@@ -938,6 +938,7 @@ test('checkout y webhook de Sexaje honran la reserva del navegador y la hora rea
   };
   const token = reserva.data.token;
   const conReserva = await crear({ reservaRegalo: token, navegadorId });
+  const sinReclamo = await crear({ navegadorId });
   const fuera = await crear({ reservaRegalo: token, navegadorId });
   const sinReserva = await crear({ regaloSlug: 'sexaje-avicola', regaloVersion: '1' });
   const otroNavegador = await crear({ reservaRegalo: token, navegadorId: crypto.randomUUID() });
@@ -951,6 +952,8 @@ test('checkout y webhook de Sexaje honran la reserva del navegador y la hora rea
     assert.equal(pago.metadata.regaloSlug, undefined);
     assert.equal(pago.regaloReservado, undefined);
   }
+  assert.equal(sinReclamo.metadata.regaloSlug, 'sexaje-avicola');
+  assert.equal(sinReclamo.regaloReservado.venceEn, reserva.data.venceEn);
   const reclamo = await apartar({ cursoSlug, navegadorId, reclamar: true });
   assert.equal(reclamo.status, 200);
   assert.equal(reclamo.data.reclamada, true);
@@ -974,7 +977,7 @@ test('checkout y webhook de Sexaje honran la reserva del navegador y la hora rea
   assert.equal(db._get('comprasCurso/' + rDentro.id).regalo, 'sexaje-avicola');
   assert.equal(db._get('accesosCurso/' + sint(rDentro.customer_details.email) + '/cursos/sexaje-avicola').stripeSessionId, rDentro.id);
 
-  const desdeOtroBoton = sesion(recuperada, 'reserva-recuperada@example.org', 'paid');
+  const desdeOtroBoton = sesion(sinReclamo, 'reserva-recuperada@example.org', 'paid');
   assert.equal(await webhook(evento('checkout.session.completed', vence - 1, desdeOtroBoton)), 200);
   assert.equal(db._get('comprasCurso/' + desdeOtroBoton.id).regalo, 'sexaje-avicola');
   await db.collection('cursosVenta').doc('sexaje-avicola').set({ nombre: 'Sexaje Avícola' });
@@ -998,6 +1001,47 @@ test('checkout y webhook de Sexaje honran la reserva del navegador y la hora rea
   };
   assert.equal(await webhook(evento('checkout.session.completed', vence + 40, legacy)), 200);
   assert.equal(db._get('comprasCurso/' + legacy.id).regalo, 'sexaje-avicola');
+});
+
+test('dos primeras aperturas simultáneas del aula ven el mismo regalo conciliado', { timeout: 5000 }, async (t) => {
+  const curso = 'embutidos-artesanales';
+  const slugRegalo = 'sexaje-avicola';
+  const uid = 'u-regalo-simultaneo';
+  const email = 'regalo-simultaneo@example.org';
+  const token = 'tRegaloSimultaneo';
+  const path = `accesosCurso/${uid}/cursos`;
+  users[token] = { uid, email, email_verified: true };
+  db.data.set('comprasCurso/cs_regalo_simultaneo', { slug: curso, email, estado: 'confirmado', regalo: slugRegalo });
+  await db.collection('cursosVenta').doc(slugRegalo).set({ nombre: 'Sexaje Avícola' });
+
+  const ref = db.collection('accesosCurso').doc(uid).collection('cursos');
+  const proto = Object.getPrototypeOf(Object.getPrototypeOf(ref));
+  const original = proto.get;
+  let lecturas = 0;
+  let liberar;
+  const ambasLecturas = new Promise(resolve => { liberar = resolve; });
+  t.mock.method(proto, 'get', async function () {
+    const resultado = await original.call(this);
+    if (this.path === path && ++lecturas <= 2) {
+      if (lecturas === 2) liberar();
+      await ambasLecturas;
+    }
+    return resultado;
+  });
+  const respuestas = await Promise.all([
+    api('/alumno/estado', { token }),
+    api('/alumno/estado', { token })
+  ]);
+  for (const aula of respuestas) {
+    assert.equal(aula.status, 200);
+    assert.deepEqual(slugs(aula), [curso, slugRegalo]);
+    assert.equal(aula.data.cursos.find(c => c.slug === slugRegalo).origen, 'regalo');
+  }
+
+  const acceso = db._get(path + '/' + slugRegalo);
+  db.data.set(path + '/' + slugRegalo, { ...acceso, revocado: true });
+  assert.deepEqual(slugs(await api('/alumno/estado', { token })), [curso]);
+  assert.equal((await api('/alumno/curso/' + slugRegalo, { token })).status, 403);
 });
 
 test('la recuperación de Stripe y la conciliación no inventan una hora previa a la caducidad', async () => {

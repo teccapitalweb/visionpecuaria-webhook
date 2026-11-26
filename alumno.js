@@ -253,6 +253,10 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
     return false;
   }
 
+  function accesoVigente(a) {
+    return a && a.revocado !== true && (a.activo === true || a.estado === 'activo');
+  }
+
   // Devuelve { slug: datosAcceso } con los cursos individuales vigentes del usuario
   async function resolverDerechos(u) {
     const ref = db.collection('accesosCurso').doc(u.uid);
@@ -262,7 +266,7 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
 
     const vigentes = {};
     for (const [slug, a] of Object.entries(directos)) {
-      if (a.activo === true || a.estado === 'activo') vigentes[slug] = a;
+      if (accesoVigente(a)) vigentes[slug] = a;
     }
 
     const email = (u.email || '').toLowerCase().trim();
@@ -292,7 +296,10 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
         log.log(`🔗 Acceso conciliado por correo verificado: ${c.slug} → ${u.uid}`);
       }
       const bonus = await aplicarRegalo(db, u.uid, c, { email, nombre: c.nombre || '' });
-      if (bonus.otorgado) vigentes[bonus.slug] = (await ref.collection('cursos').doc(bonus.slug).get()).data();
+      if (bonus.slug && !vigentes[bonus.slug]) {
+        const acceso = (await ref.collection('cursos').doc(bonus.slug).get()).data();
+        if (accesoVigente(acceso)) vigentes[bonus.slug] = acceso;
+      }
       if (c.uid !== u.uid) {
         await db.collection('comprasCurso').doc(c.sessionId).set({ uidVinculado: u.uid }, { merge: true });
       }
@@ -304,7 +311,7 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
     const d = await db.collection('accesosCurso').doc(u.uid).collection('cursos').doc(slug).get();
     if (d.exists) {
       const a = d.data() || {};
-      if (a.activo === true || a.estado === 'activo') return a;
+      if (accesoVigente(a)) return a;
       if (a.revocado === true) return null;
     }
     const todos = await resolverDerechos(u);
