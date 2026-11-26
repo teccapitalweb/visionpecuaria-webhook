@@ -1,7 +1,9 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const Stripe = require('stripe');
-const { apartarRegalo, metadataRegaloCheckout, regaloParaPago, aplicarRegalo } = require('./regalos');
+const { metadataMetaCheckout, reportarCompraMeta } = require('./meta-conversions');
+const { nuevaClaveEntrada } = require('./entrada-checkout');
+const { apartarRegalo, prepararRegaloCheckout, regaloParaPago, aplicarRegalo } = require('./regalos');
 const { obtenerOfertaPromocional, precioVigenteCentavos, OFERTAS_PROMOCIONALES } = require('./promociones-cursos');
 const {
   guardarEventoPromo, registrarCheckoutActividad, registrarCompraPagada,
@@ -33,6 +35,7 @@ const AULA_EN_LANDING = {
   'gallinas-de-postura': '/gallinas-de-postura.html',
   'embutidos-artesanales': '/embutidos-artesanales.html'
 };
+const ORIGENES_LANDINGS = new Set(['https://visionpecuariamx.com', 'https://www.visionpecuariamx.com']);
 
 // ─── Resend (envío de correos) ───────────────────────────────────────────────
 // La API key vive en Railway como RESEND_API_KEY.
@@ -437,8 +440,8 @@ app.get('/alumno/promociones/cotizacion', async (req, res) => {
 app.post('/publico/cursos/regalo/apartar', async (req, res) => {
   res.setHeader('Cache-Control', 'private, no-store');
   try {
-    const { cursoSlug, navegadorId } = req.body || {};
-    const reserva = await apartarRegalo(db, { cursoSlug, navegadorId, secretoWebhook: STRIPE_WEBHOOK_SECRET });
+    const { cursoSlug, navegadorId, reclamar } = req.body || {};
+    const reserva = await apartarRegalo(db, { cursoSlug, navegadorId, reclamar, secretoWebhook: STRIPE_WEBHOOK_SECRET });
     res.json({ ...reserva, ahora: new Date().toISOString() });
   } catch (err) {
     if (err.status) return res.status(err.status).json({ error: err.message });
@@ -452,7 +455,7 @@ app.post('/crear-checkout-curso', async (req, res) => {
   try {
     const {
       slug: slugRaw, uid: uidRaw, email: emailRaw, nombre: nombreRaw, whatsapp: whatsappRaw,
-      origenSlug: origenRaw, atribucionOrigen, visitaId: visitaRaw, dispositivo, navegadorId, reservaRegalo
+      origenSlug: origenRaw, atribucionOrigen, visitaId: visitaRaw, dispositivo, navegadorId, reservaRegalo, meta
     } = req.body || {};
 
     const slug = sanearTexto(slugRaw);
@@ -466,7 +469,6 @@ app.post('/crear-checkout-curso', async (req, res) => {
     let oferta;
     let usuarioOferta;
     if (origenSlug) {
-      res.setHeader('Cache-Control', 'private, no-store');
       const usuario = await autenticarSolicitud(req, res);
       if (!usuario) return;
       try { oferta = await obtenerOfertaPromocional(db, usuario, origenSlug, slug); }
@@ -516,9 +518,13 @@ app.post('/crear-checkout-curso', async (req, res) => {
 
     // 4) Crear Stripe Checkout Session (modo payment, no subscription)
     const nombreCurso = curso.nombre || curso.titulo || 'Curso Visión Pecuaria';
+    const origenPeticion = req.get('origin');
+    const origenRetorno = ORIGENES_LANDINGS.has(origenPeticion) ? origenPeticion : SITIO_URL;
+    const rutaAula = Object.hasOwn(AULA_EN_LANDING, slug) ? AULA_EN_LANDING[slug] : null;
+    const { claveEntrada, huellaEntrada } = rutaAula ? nuevaClaveEntrada() : {};
     // Stripe fija el correo al usar un Customer con email. Un prellenado por sí solo se puede editar.
     const clientePromo = oferta ? await stripe.customers.create({ email, ...(nombre ? { name: nombre } : {}), metadata: { uid } }) : null;
-    const regalo = metadataRegaloCheckout({
+    const regalo = await prepararRegaloCheckout(db, {
       cursoSlug: slug, navegadorId, token: reservaRegalo, secretoWebhook: STRIPE_WEBHOOK_SECRET
     });
     const session = await stripe.checkout.sessions.create({
@@ -540,17 +546,19 @@ app.post('/crear-checkout-curso', async (req, res) => {
       allow_promotion_codes: !oferta,
       metadata: {
         tipo: 'curso',
+        ...(huellaEntrada ? { huellaEntrada } : {}),
         slug,
         uid,
         nombre,
         whatsapp,
         email,
         ...regalo.metadata,
+        ...metadataMetaCheckout({ slug, origen: req.get('origin'), agente: req.get('user-agent'), meta }),
         ...(oferta ? { promoOrigenSlug: origenSlug, promoDescuentoCentavos: String(oferta.descuentoCentavos) } : {})
       },
       // Gallinas y Embutidos tienen el aula dentro de su propia landing: al pagar se vuelve ahí y se entra directo.
-      return_url: AULA_EN_LANDING[slug]
-        ? `${SITIO_URL}${AULA_EN_LANDING[slug]}?pago=ok&session_id={CHECKOUT_SESSION_ID}`
+      return_url: rutaAula
+        ? `${origenRetorno}${rutaAula}?pago=ok&session_id={CHECKOUT_SESSION_ID}`
         : `${SITIO_URL}/curso-acceso.html?slug=${encodeURIComponent(slug)}&session_id={CHECKOUT_SESSION_ID}`
     });
 
@@ -575,6 +583,7 @@ app.post('/crear-checkout-curso', async (req, res) => {
     res.json({
       clientSecret: session.client_secret,
       sessionId: session.id,
+      ...(claveEntrada ? { claveEntrada } : {}),
       ...(regalo.reservado ? { regaloReservado: regalo.reservado } : {}),
       ...(oferta ? { oferta } : {})
     });
@@ -921,6 +930,7 @@ async function procesarEventoCompraCurso(event) {
   await procesarCompraCurso(session, confirmadoEn);
   try { await registrarCompraPagada(db, session, confirmadoEn); }
   catch (err) { console.warn('No se pudo registrar la métrica del pago de curso:', err.code || err.name); }
+  await reportarCompraMeta({ db, session, confirmadoEn, liveMode: event.livemode });
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

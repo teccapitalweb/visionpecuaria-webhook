@@ -18,6 +18,8 @@
 //     "última clase" solo cambia con una marca de tiempo más nueva).
 // ═════════════════════════════════════════════════════════════════════════════
 const crypto = require('crypto');
+const { claveEntradaValida, uidDePago } = require('./entrada-checkout');
+const { pixelPurchaseEventId } = require('./meta-conversions');
 const { regaloParaPago, aplicarRegalo } = require('./regalos');
 const { registrarMetricasPromocion } = require('./promocion-analytics');
 const { registrarGalloIA } = require('./gallo-ia');
@@ -337,10 +339,9 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
   }
 
   // ─── ENTRADA DIRECTA TRAS EL PAGO ──────────────────────────────────────────
-  // Al volver de Stripe, la landing manda el session_id. Si el pago está confirmado y el correo NO tenía cuenta,
-  // se crea la cuenta (correo verificado: lo escribió quien pagó) y se entrega un token de un solo uso para entrar
-  // sin pasos extra. Si el correo YA tenía cuenta no se entrega token: pagar con el correo de otra persona no debe
-  // abrir su cuenta; esa persona entra con su acceso de siempre y ve el curso nuevo.
+  // La clave vuelve desde el navegador que abrió Stripe. Una sesión Firebase que
+  // ya verificó el correo usa sus derechos normales. La entrada de invitado
+  // sólo concede este pago y no verifica ni enlaza el correo escrito en Stripe.
   const VENTANA_ENTRADA_SEG = 60 * 60;
   const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
   app.post('/alumno/entrar-por-pago', async (req, res) => {
@@ -358,36 +359,72 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
       }
       const slug = String(meta.slug);
       const email = String((s.customer_details && s.customer_details.email) || s.customer_email || meta.email || '').toLowerCase().trim();
-      const base = { ok: true, pagado: true, slug, monto: typeof s.amount_total === 'number' ? s.amount_total / 100 : null };
+      const base = {
+        ok: true, pagado: true, slug, monto: typeof s.amount_total === 'number' ? s.amount_total / 100 : null,
+        moneda: typeof s.currency === 'string' && /^[a-z]{3}$/i.test(s.currency) ? s.currency.toUpperCase() : null,
+        pixelPurchaseEventId: pixelPurchaseEventId(sessionId)
+      };
       if (!email) return res.json({ ...base, entrada: 'manual' });
 
-      // El acceso lo registra el webhook de Stripe; se le da unos segundos para que el aula ya lo encuentre.
+      const authHeader = req.get('authorization') || '';
+      const usuario = authHeader.startsWith('Bearer ')
+        ? await auth.verifyIdToken(authHeader.slice(7).trim(), true).catch(() => null) : null;
+      const esTitular = usuario?.email_verified === true && (usuario.email || '').toLowerCase().trim() === email;
+      const antiguedad = Date.now() / 1000 - s.created;
+      const tieneClave = Number.isSafeInteger(s.created) && antiguedad >= 0 && antiguedad <= VENTANA_ENTRADA_SEG &&
+        claveEntradaValida(req.body?.claveEntrada, meta.huellaEntrada);
+      if (!esTitular && !tieneClave) return res.json({ ...base, entrada: 'manual' });
+
+      // El invitado recibe acceso cuando ya existe una inscripción confirmada.
       const tope = Number(req.body?.esperaMs) >= 0 ? Math.min(Number(req.body.esperaMs), 8000) : 8000;
-      let registrado = false;
+      const compraRef = db.collection('comprasCurso').doc(sessionId);
+      let compra;
       for (let t = 0; ; t += 500) {
-        registrado = (await db.collection('comprasCurso').doc(sessionId).get()).exists;
-        if (registrado || t >= tope) break;
+        const datos = (await compraRef.get()).data();
+        if (datos?.estado === 'confirmado' && datos.slug === slug) {
+          compra = { ...datos, sessionId };
+          break;
+        }
+        if (t >= tope) break;
         await esperar(500);
       }
-      if (registrado) {
-        const compra = (await db.collection('comprasCurso').doc(sessionId).get()).data() || {};
-        if (compra.estado === 'confirmado' && compra.regalo) base.regalo = compra.regalo;
+      if (!compra) {
+        return res.status(409).json({ ...base, pendiente: true, error: 'Estamos preparando tu acceso' });
       }
+      base.registrado = true;
+      if (compra.regalo) base.regalo = compra.regalo;
+      if (esTitular) return res.json({ ...base, entrada: 'sesion' });
 
-      const reciente = !s.created || (Date.now() / 1000 - Number(s.created)) <= VENTANA_ENTRADA_SEG;
-      const refEntrada = db.collection('entradasPorPago').doc(sessionId);
-      const yaUsada = (await refEntrada.get()).exists;
-      let existente = null;
-      try { existente = await auth.getUserByEmail(email); }
-      catch (e) { if (e.code !== 'auth/user-not-found') throw e; }
-      if (existente || yaUsada || !reciente) return res.json({ ...base, registrado, entrada: 'manual', cuentaExistente: !!existente });
+      // Un pago con el correo de una cuenta existente no autoriza a entrar en ella.
+      try {
+        await auth.getUserByEmail(email);
+        return res.json({ ...base, entrada: 'manual' });
+      } catch (e) { if (e.code !== 'auth/user-not-found') throw e; }
 
-      const nombre = String((s.customer_details && s.customer_details.name) || meta.nombre || '').trim().slice(0, 120);
-      const nuevo = await auth.createUser({ email, emailVerified: true, ...(nombre ? { displayName: nombre } : {}) });
-      await refEntrada.set({ sessionId, slug, email, uid: nuevo.uid, usadaEn: new Date().toISOString() });
-      const token = await auth.createCustomToken(nuevo.uid);
-      log.log(`🎟️ Entrada directa tras el pago: ${slug} → ${nuevo.uid}`);
-      return res.json({ ...base, registrado, entrada: 'token', token });
+      const entradaRef = db.collection('entradasPorPago').doc(sessionId);
+      const invitado = !usuario?.email && /^vp-compra-[a-f0-9]{64}$/.test(usuario?.uid || '') ? usuario.uid : null;
+      const uid = await db.runTransaction(async tx => {
+        const entrada = (await tx.get(entradaRef)).data();
+        const uid = entrada?.uid || invitado || uidDePago(sessionId);
+        if (!/^vp-compra-[a-f0-9]{64}$/.test(uid)) return null;
+        const accesoRef = db.collection('accesosCurso').doc(uid).collection('cursos').doc(slug);
+        const acceso = (await tx.get(accesoRef)).data();
+        if (acceso?.revocado === true) return null;
+        if (!acceso?.activo) {
+          tx.set(accesoRef, {
+            slug, email, nombre: compra.nombre || '', activo: true, estado: 'activo',
+            fechaCompra: compra.fechaCompra || null, stripeSessionId: sessionId,
+            montoPagadoCentavos: s.amount_total || 0, origen: 'compra-validada'
+          }, { merge: true });
+        }
+        if (!entrada) tx.set(entradaRef, { uid, slug, creadaEn: new Date().toISOString() });
+        return uid;
+      });
+      if (!uid) return res.json({ ...base, entrada: 'manual' });
+      await aplicarRegalo(db, uid, compra, { email, nombre: compra.nombre || '' });
+      if (usuario?.uid === uid) return res.json({ ...base, entrada: 'sesion' });
+      const token = await auth.createCustomToken(uid);
+      return res.json({ ...base, entrada: 'token', token });
     } catch (err) {
       log.error('❌ /alumno/entrar-por-pago:', err);
       res.status(500).json({ error: 'No pudimos abrir tu acceso' });
@@ -490,6 +527,7 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
           claseEnVivo: curso.linkClaseEnVivo ? { url: curso.linkClaseEnVivo, fecha: curso.fechaClaseEnVivo || null } : null
         },
         acceso: { fechaCompra: acceso.fechaCompra || null, origen: acceso.origen === 'regalo' ? 'regalo' : 'compra' },
+        correoEntrega: u.email || acceso.email || null,
         clases: clases.map(sinRaw),
         materiales: materiales.map(sinRaw),
         progreso: {
@@ -611,7 +649,7 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
       const ahora = new Date().toISOString();
       const datos = {
         uid: u.uid,
-        email: (u.email || '').toLowerCase(),
+        email: (u.email || acceso.email || '').toLowerCase(),
         emailVerificado: u.email_verified === true,
         slug,
         cursoNombre: (curso && (curso.nombre || curso.titulo)) || slug,
