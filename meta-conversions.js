@@ -11,13 +11,14 @@ const FB_C = /^fb\.\d+\.\d{10,16}\.[A-Za-z0-9_.-]{5,450}$/;
 const SEMANA_SEGUNDOS = 7 * 24 * 60 * 60;
 
 const hash = valor => createHash('sha256').update(valor).digest('hex');
+const tokenConfigurado = token => typeof token === 'string' && !!token.trim() && !/^\d+$/.test(token.trim());
 
 function pixelPurchaseEventId(sessionId) {
   return 'vp_purchase_' + hash(sessionId);
 }
 
 function metadataMetaCheckout({ slug, origen, agente, meta, token = process.env.META_CONVERSIONS_ACCESS_TOKEN }) {
-  if (!token || !LANDINGS.has(slug) || !ORIGENES.has(origen) || !agente) return {};
+  if (!tokenConfigurado(token) || !LANDINGS.has(slug) || !ORIGENES.has(origen) || !agente) return {};
   return {
     metaOrigen: origen,
     metaAgente: agente.replace(/[\r\n]/g, ' ').trim().slice(0, 500),
@@ -33,7 +34,7 @@ async function reportarCompraMeta({
   const { id, amount_total: monto, currency: moneda, metadata = {} } = session;
   const ruta = LANDINGS.get(metadata.slug);
   const fecha = Math.floor(confirmadoEn.getTime() / 1000);
-  if (!token || liveMode !== true || session.payment_status !== 'paid' || !ruta ||
+  if (!tokenConfigurado(token) || liveMode !== true || session.payment_status !== 'paid' || !ruta ||
       !Number.isSafeInteger(monto) || monto <= 0 || !/^[a-z]{3}$/i.test(moneda || '') ||
       !ORIGENES.has(metadata.metaOrigen) || !metadata.metaAgente ||
       !Number.isSafeInteger(fecha) || fecha < Math.floor(ahora / 1000) - SEMANA_SEGUNDOS) return;
@@ -70,7 +71,7 @@ async function reportarCompraMeta({
   try {
     respuesta = await enviar('https://graph.facebook.com/v27.0/' + PIXEL_ID + '/events', {
       method: 'POST',
-      body: new URLSearchParams({ data: JSON.stringify([evento]), access_token: token }),
+      body: new URLSearchParams({ data: JSON.stringify([evento]), access_token: token.trim() }),
       signal: AbortSignal.timeout(2500)
     });
   } catch {
