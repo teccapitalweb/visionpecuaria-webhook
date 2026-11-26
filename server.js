@@ -1,6 +1,7 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const Stripe = require('stripe');
+const { metadataMetaCheckout, reportarCompraMeta } = require('./meta-conversions');
 const { apartarRegalo, prepararRegaloCheckout, regaloParaPago, aplicarRegalo } = require('./regalos');
 const { obtenerOfertaPromocional, precioVigenteCentavos, OFERTAS_PROMOCIONALES } = require('./promociones-cursos');
 const {
@@ -452,7 +453,7 @@ app.post('/crear-checkout-curso', async (req, res) => {
   try {
     const {
       slug: slugRaw, uid: uidRaw, email: emailRaw, nombre: nombreRaw, whatsapp: whatsappRaw,
-      origenSlug: origenRaw, atribucionOrigen, visitaId: visitaRaw, dispositivo, navegadorId, reservaRegalo
+      origenSlug: origenRaw, atribucionOrigen, visitaId: visitaRaw, dispositivo, navegadorId, reservaRegalo, meta
     } = req.body || {};
 
     const slug = sanearTexto(slugRaw);
@@ -546,6 +547,7 @@ app.post('/crear-checkout-curso', async (req, res) => {
         whatsapp,
         email,
         ...regalo.metadata,
+        ...metadataMetaCheckout({ slug, origen: req.get('origin'), agente: req.get('user-agent'), meta }),
         ...(oferta ? { promoOrigenSlug: origenSlug, promoDescuentoCentavos: String(oferta.descuentoCentavos) } : {})
       },
       // Gallinas y Embutidos tienen el aula dentro de su propia landing: al pagar se vuelve ahí y se entra directo.
@@ -921,6 +923,7 @@ async function procesarEventoCompraCurso(event) {
   await procesarCompraCurso(session, confirmadoEn);
   try { await registrarCompraPagada(db, session, confirmadoEn); }
   catch (err) { console.warn('No se pudo registrar la métrica del pago de curso:', err.code || err.name); }
+  await reportarCompraMeta({ db, session, confirmadoEn, liveMode: event.livemode });
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
