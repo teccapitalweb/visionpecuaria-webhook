@@ -114,7 +114,7 @@ test('solo la confirmación dentro de la hora concede el regalo de las sesiones 
   assert.equal(await regaloParaPago(db, { ...session, metadata: { tipo: 'curso', slug: cursoSlug } }, antes), 'sexaje-avicola');
 });
 
-test('el checkout recupera la reserva reclamada del mismo navegador y del mismo curso', async () => {
+test('el checkout recupera la ventana del mismo navegador y curso sin exigir un reclamo', async () => {
   const db = dbConRegla();
   const cursoSlug = 'gallinas-de-postura';
   const otroCurso = 'embutidos-artesanales';
@@ -123,9 +123,12 @@ test('el checkout recupera la reserva reclamada del mismo navegador y del mismo 
   const sinRegalo = { metadata: { regaloVersion: '2' } };
 
   await assert.rejects(apartarRegalo(db, { ...datos, reclamar: true }), { status: 409 });
+  assert.deepEqual(await prepararRegaloCheckout(db, datos), sinRegalo);
   const oferta = await apartarRegalo(db, datos);
   assert.equal(oferta.reclamada, false);
-  assert.deepEqual(await prepararRegaloCheckout(db, datos), sinRegalo);
+  assert.deepEqual(await prepararRegaloCheckout(db, datos),
+    metadataRegaloCheckout({ ...datos, token: oferta.token }));
+  assert.equal((await apartarRegalo(db, datos)).reclamada, false);
 
   const reclamada = await apartarRegalo(db, { ...datos, ahora: new Date('2026-11-23T12:30:00Z'), reclamar: true });
   assert.equal(reclamada.reclamada, true);
