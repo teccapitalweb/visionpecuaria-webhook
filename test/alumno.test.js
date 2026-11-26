@@ -855,10 +855,32 @@ test('entrar por pago: sólo el navegador del checkout obtiene acceso de invitad
   assert.equal(db._get(`accesosCurso/${uid}/cursos/embutidos-artesanales`).activo, true);
   assert.equal(db._get(`accesosCurso/${uid}/cursos/sexaje-avicola`).origen, 'regalo');
   users.tInvitado = { uid };
+  db.data.set('cursosVenta/sexaje-avicola', {
+    nombre: 'Sexaje Avícola',
+    clases: [{ id: 'c1', orden: 1, titulo: 'Clase 1', storagePath: 'cursos/sexaje/clase-01.mp4' }],
+    recursosDescargables: [{ id: 'm1', titulo: 'Manual', tipo: 'pdf', storagePath: 'cursos/sexaje/manual.pdf' }]
+  });
   const derechos = await api('/alumno/estado', { token: 'tInvitado' });
   assert.equal(derechos.status, 200);
   assert.equal(derechos.data.usuario.verificado, false);
   assert.equal(derechos.data.cursos.some(curso => curso.slug === 'gallinas-de-postura'), false);
+  assert.equal(derechos.data.cursos.find(curso => curso.slug === 'sexaje-avicola').origen, 'regalo');
+  const rutaRegalo = '/alumno/curso/sexaje-avicola';
+  assert.equal((await api(rutaRegalo, { token: 'tOtro' })).status, 403);
+  assert.equal((await api(rutaRegalo, { token: 'tInvitado' })).data.correoEntrega, 'recien@gmail.com');
+  for (const [ruta, body] of [
+    [rutaRegalo + '/video', { claseId: 'c1' }],
+    [rutaRegalo + '/material', { materialId: 'm1' }],
+    [rutaRegalo + '/progreso', { claseId: 'c1', segundos: 50 }],
+    [rutaRegalo + '/certificado/solicitar', { nombreCompleto: 'Rita Nueva', whatsapp: '5512345678', estado: 'Puebla' }],
+    ['/alumno/gallo-ia', { cursoSlug: 'sexaje-avicola', mensaje: '¿Cómo veo los materiales?' }]
+  ]) {
+    const resultado = await api(ruta, { token: 'tInvitado', method: 'POST', body });
+    assert.equal(resultado.status, 200, ruta);
+  }
+  const certificado = db._get(`solicitudesCertificado/${uid}_sexaje-avicola`);
+  assert.equal(certificado.email, 'recien@gmail.com');
+  assert.equal(certificado.emailVerificado, false);
   const mismaSesion = await api('/alumno/entrar-por-pago', {
     method: 'POST', token: 'tInvitado', body: { sessionId: 'cs_nuevo', claveEntrada, esperaMs: 0 }
   });

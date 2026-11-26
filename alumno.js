@@ -527,6 +527,7 @@ function registrarRutasAlumno(app, { admin, db, auth, stripe, bucketName = BUCKE
           claseEnVivo: curso.linkClaseEnVivo ? { url: curso.linkClaseEnVivo, fecha: curso.fechaClaseEnVivo || null } : null
         },
         acceso: { fechaCompra: acceso.fechaCompra || null, origen: acceso.origen === 'regalo' ? 'regalo' : 'compra' },
+        correoEntrega: u.email || acceso.email || null,
         clases: clases.map(sinRaw),
         materiales: materiales.map(sinRaw),
         progreso: {
