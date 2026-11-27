@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const { createHash } = require('node:crypto');
 const test = require('node:test');
-const { metadataMetaCheckout, pixelPurchaseEventId, reportarCompraMeta } = require('../meta-conversions');
+const { ipCliente, metadataMetaCheckout, pixelPurchaseEventId, reportarCompraMeta } = require('../meta-conversions');
 
 const origen = 'https://visionpecuariamx.com';
 const agente = 'Navegador de prueba';
@@ -73,8 +73,35 @@ test('envía solo el pago confirmado con importe, origen e ID opaco compartido c
     client_user_agent: agente, fbp, fbc,
     em: [createHash('sha256').update('alumna@example.test').digest('hex')]
   });
-  assert.deepEqual(evento.custom_data, { value: 399.99, currency: 'MXN', content_type: 'product', content_ids: [slug] });
+  assert.deepEqual(evento.custom_data,
+    { value: 399.99, currency: 'MXN', content_type: 'product', content_name: slug, content_ids: [slug] });
   assert.ok(registro.metaConversionEnviadaEn);
+});
+
+test('agrega IP, teléfono y país cifrados para que Meta reconozca mejor al comprador', async () => {
+  const { registrar, session, peticiones } = escenario();
+  await registrar({ session: { ...session,
+    customer_details: { ...session.customer_details, phone: '+52 238 147 9821', address: { country: 'MX' } },
+    metadata: { ...session.metadata, metaIp: '201.141.20.7' } } });
+  const sha = valor => createHash('sha256').update(valor).digest('hex');
+  const { user_data } = peticiones[0].evento;
+  assert.equal(user_data.client_ip_address, '201.141.20.7');
+  assert.deepEqual(user_data.ph, [sha('522381479821')]);
+  assert.deepEqual(user_data.country, [sha('mx')]);
+});
+
+test('normaliza teléfono de 10 dígitos con lada 52, ignora IP inválida y toma la IP real detrás del proxy', async () => {
+  const { registrar, session, peticiones } = escenario();
+  await registrar({ session: { ...session, customer_details: { email: 'a@b.test' },
+    metadata: { ...session.metadata, whatsapp: '2381479821', metaIp: 'no-es-ip' } } });
+  const { user_data } = peticiones[0].evento;
+  assert.deepEqual(user_data.ph, [createHash('sha256').update('522381479821').digest('hex')]);
+  assert.equal(user_data.client_ip_address, undefined);
+  assert.equal(ipCliente('201.141.20.7, 10.0.0.1', '10.0.0.1'), '201.141.20.7');
+  assert.equal(ipCliente('', '::ffff:189.203.4.5'), '189.203.4.5');
+  assert.equal(ipCliente('basura', 'otra'), null);
+  assert.deepEqual(metadataMetaCheckout({ slug, origen, agente, ip: '201.141.20.7', token }),
+    { metaOrigen: origen, metaAgente: agente, metaIp: '201.141.20.7' });
 });
 
 test('no envía si se desactiva, el pago está pendiente, es de prueba o carece de un checkout instrumentado', async () => {
