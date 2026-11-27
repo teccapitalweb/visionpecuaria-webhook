@@ -1,4 +1,5 @@
 const { createHash } = require('node:crypto');
+const { isIP } = require('node:net');
 
 const PIXEL_ID = '2380050672518265';
 const LANDINGS = new Map([
@@ -17,11 +18,25 @@ function pixelPurchaseEventId(sessionId) {
   return 'vp_purchase_' + hash(sessionId);
 }
 
-function metadataMetaCheckout({ slug, origen, agente, meta, token = process.env.META_CONVERSIONS_ACCESS_TOKEN }) {
+// IP real del navegador detrás del proxy de Railway (primer valor de X-Forwarded-For).
+function ipCliente(reenviada, directa) {
+  const candidata = String(reenviada || '').split(',')[0].trim() || String(directa || '').replace(/^::ffff:/, '');
+  return isIP(candidata) ? candidata : null;
+}
+
+// Teléfono en formato que pide Meta: solo dígitos con lada de país (México = 52).
+function telefonoMeta(telefono) {
+  const digitos = String(telefono || '').replace(/\D/g, '');
+  if (digitos.length === 10) return '52' + digitos;
+  return digitos.length >= 11 && digitos.length <= 15 ? digitos : null;
+}
+
+function metadataMetaCheckout({ slug, origen, agente, ip, meta, token = process.env.META_CONVERSIONS_ACCESS_TOKEN }) {
   if (!tokenConfigurado(token) || !LANDINGS.has(slug) || !ORIGENES.has(origen) || !agente) return {};
   return {
     metaOrigen: origen,
     metaAgente: agente.replace(/[\r\n]/g, ' ').trim().slice(0, 500),
+    ...(isIP(ip || '') ? { metaIp: ip } : {}),
     ...(typeof meta?.fbp === 'string' && FB_P.test(meta.fbp) ? { metaFbp: meta.fbp } : {}),
     ...(typeof meta?.fbc === 'string' && FB_C.test(meta.fbc) ? { metaFbc: meta.fbc } : {})
   };
@@ -42,6 +57,9 @@ async function reportarCompraMeta({
   const email = (session.customer_details?.email || session.customer_email || metadata.email || '').trim().toLowerCase();
   const fbp = FB_P.test(metadata.metaFbp || '') ? metadata.metaFbp : null;
   const fbc = FB_C.test(metadata.metaFbc || '') ? metadata.metaFbc : null;
+  const ip = isIP(metadata.metaIp || '') ? metadata.metaIp : null;
+  const telefono = telefonoMeta(session.customer_details?.phone || metadata.whatsapp);
+  const pais = String(session.customer_details?.address?.country || '').trim().toLowerCase();
   if (!email && !fbp && !fbc) return;
 
   const ref = db.collection('comprasCurso').doc(id);
@@ -56,7 +74,10 @@ async function reportarCompraMeta({
     event_source_url: metadata.metaOrigen + ruta,
     user_data: {
       client_user_agent: metadata.metaAgente,
+      ...(ip ? { client_ip_address: ip } : {}),
       ...(email ? { em: [hash(email)] } : {}),
+      ...(telefono ? { ph: [hash(telefono)] } : {}),
+      ...(/^[a-z]{2}$/.test(pais) ? { country: [hash(pais)] } : {}),
       ...(fbp ? { fbp } : {}),
       ...(fbc ? { fbc } : {})
     },
@@ -64,6 +85,7 @@ async function reportarCompraMeta({
       currency: moneda.toUpperCase(),
       value: monto / 100,
       content_type: 'product',
+      content_name: metadata.slug,
       content_ids: [metadata.slug]
     }
   };
@@ -90,4 +112,4 @@ async function reportarCompraMeta({
   await ref.set({ metaConversionEnviadaEn: new Date(ahora).toISOString() }, { merge: true });
 }
 
-module.exports = { metadataMetaCheckout, pixelPurchaseEventId, reportarCompraMeta };
+module.exports = { ipCliente, metadataMetaCheckout, pixelPurchaseEventId, reportarCompraMeta };

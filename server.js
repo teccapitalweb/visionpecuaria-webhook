@@ -1,7 +1,7 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const Stripe = require('stripe');
-const { metadataMetaCheckout, reportarCompraMeta } = require('./meta-conversions');
+const { ipCliente, metadataMetaCheckout, reportarCompraMeta } = require('./meta-conversions');
 const { nuevaClaveEntrada } = require('./entrada-checkout');
 const { apartarRegalo, prepararRegaloCheckout, regaloParaPago, aplicarRegalo } = require('./regalos');
 const { obtenerOfertaPromocional, precioVigenteCentavos, OFERTAS_PROMOCIONALES } = require('./promociones-cursos');
@@ -553,7 +553,10 @@ app.post('/crear-checkout-curso', async (req, res) => {
         whatsapp,
         email,
         ...regalo.metadata,
-        ...metadataMetaCheckout({ slug, origen: req.get('origin'), agente: req.get('user-agent'), meta }),
+        ...metadataMetaCheckout({
+          slug, origen: req.get('origin'), agente: req.get('user-agent'),
+          ip: ipCliente(req.get('x-forwarded-for'), req.socket?.remoteAddress), meta
+        }),
         ...(oferta ? { promoOrigenSlug: origenSlug, promoDescuentoCentavos: String(oferta.descuentoCentavos) } : {})
       },
       // Gallinas y Embutidos tienen el aula dentro de su propia landing: al pagar se vuelve ahí y se entra directo.
